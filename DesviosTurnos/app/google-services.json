@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "633052656166",
+    "project_id": "desvio-llamadas",
+    "storage_bucket": "desvio-llamadas.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:633052656166:android:66c5a134694fbbb77bace7",
+        "android_client_info": {
+          "package_name": "com.example.desviosturnos"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBh9Mcr16hAAq_Q-WotQ3YGKS6gpEv23Uk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

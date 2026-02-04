@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/rootLayout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="24dp"
+    android:gravity="center_horizontal">
+
+    <TextView
+        android:id="@+id/tvTitle"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Desvíos y Turnos"
+        android:textSize="22sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="24dp" />
+
+    <Button
+        android:id="@+id/btnRequestPerms"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Conceder permisos"
+        android:layout_marginBottom="16dp" />
+
+    <Button
+        android:id="@+id/btnTestCall"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Llamada de prueba"
+        android:layout_marginBottom="24dp" />
+
+    <Button
+        android:id="@+id/btnScheduleTest"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Programar llamada en 2 minutos"
+        android:layout_marginBottom="16dp" />
+
+    <TextView
+        android:id="@+id/tvDebug"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Debug: -"
+        android:textSize="14sp"
+        android:layout_marginTop="16dp" />
+
+    <TextView
+        android:id="@+id/tvInfo"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Pulsa 'Conceder permisos' y luego 'Llamada de prueba'."
+        android:textSize="14sp"
+        android:gravity="center"
+        android:textColor="#666666" />
+
+</LinearLayout>
