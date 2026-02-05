@@ -136,7 +136,13 @@ class MainActivity : ComponentActivity() {
             return@OnSharedPreferenceChangeListener
         }
 
-        if (key != KEY_LAST_RESULT && key != KEY_LAST_TS && key != KEY_LAST_TEXT) {
+        if (
+            key != KEY_LAST_RESULT &&
+            key != KEY_LAST_TS &&
+            key != KEY_LAST_TEXT &&
+            key != KEY_EXPECTED_MMI &&
+            key != KEY_ARMED_SINCE
+        ) {
             Log.e("SNIFFER_LISTENER", "DROP key not relevant: $key")
             return@OnSharedPreferenceChangeListener
         }
@@ -255,8 +261,27 @@ class MainActivity : ComponentActivity() {
             forceHoliday -> OperationMode.FESTIVO
             officeMode -> OperationMode.OFICINA
             n1Active -> OperationMode.NORMAL
-            else -> OperationMode.FESTIVO
+            else -> OperationMode.NORMAL
         }
+    }
+
+    private fun selectionDecision(
+        reason: String,
+        at: ZonedDateTime,
+        mode: String,
+        chosenId: String?,
+        nightId: String?,
+        n2Id: String?
+    ): String {
+        val why = when {
+            chosenId == nightId -> "night"
+            chosenId == n2Id -> "n2"
+            chosenId.isNullOrBlank() -> "none"
+            else -> "other"
+        }
+        val msg = "SELECT at=$at mode=$mode reason=$reason chosen=$chosenId night=$nightId n2=$n2Id winner=$why"
+        Log.e("SHIFT_SELECT", msg)
+        return msg
     }
 
     private fun normalizeId(raw: Any?): String? {
@@ -326,65 +351,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun selectAt(cfg: Map<String, Any?>, at: ZonedDateTime): Selection {
-        val mode = readMode(cfg)
-        val n2 = n2Id(cfg)
-
-        val morning = shiftContactId(cfg, "morning")
-        val after = shiftContactId(cfg, "afternoon")
-        val night = shiftContactId(cfg, "night")
-
-        val dow = at.dayOfWeek
-        val t = at.toLocalTime()
-        val interId = interIdForDay(cfg, dow)
-        val isLV = isWeekday(dow)
-        if (mode == OperationMode.FESTIVO) {
-            return Selection(n2, ShiftLabel.GUARDIA.es, "MODE_FESTIVO")
-        }
-        if (isWeekendN2Window(at)) {
-            return Selection(n2, ShiftLabel.GUARDIA.es, "WEEKEND_N2_WINDOW")
-        }
-        if (isNightDJ(dow) && inRange(t, "23:00", "07:00")) {
-            val chosen = night ?: n2
-            return Selection(
-                chosen,
-                shiftLabelFromChosen(chosen, morning, after, night, interId, n2),
-                if (night != null) "NOCHE" else "NOCHE_FALLBACK_N2"
-            )
-        }
-        if (mode == OperationMode.OFICINA) {
-            val chosen = if (interId != null && inInterWindow(at)) interId else n2
-            return Selection(
-                chosen,
-                shiftLabelFromChosen(chosen, morning, after, night, interId, n2),
-                "OFICINA"
-            )
-        }
-        if (!isLV) {
-            return Selection(n2, ShiftLabel.GUARDIA.es, "NORMAL_NO_LV_N2")
-        }
-        if (inRange(t, "07:00", "15:00")) {
-            if (morning != null) {
-                return Selection(morning, ShiftLabel.MANANA.es, "MANANA")
-            }
-            val chosen = if (interId != null && inInterWindow(at)) interId else n2
-            return Selection(
-                chosen,
-                shiftLabelFromChosen(chosen, morning, after, night, interId, n2),
-                if (interId != null) "MANANA_FALLBACK_INTER" else "MANANA_FALLBACK_N2"
-            )
-        }
-        if (inRange(t, "15:00", "23:00")) {
-            if (after != null) {
-                return Selection(after, ShiftLabel.TARDE.es, "TARDE")
-            }
-            val chosen = if (interId != null && inInterWindow(at)) interId else n2
-            return Selection(
-                chosen,
-                shiftLabelFromChosen(chosen, morning, after, night, interId, n2),
-                if (interId != null) "TARDE_FALLBACK_INTER" else "TARDE_FALLBACK_N2"
-            )
-        }
-        return Selection(n2, ShiftLabel.GUARDIA.es, "DEFAULT_N2")
+        val d = ShiftSelectionEngine.selectAt(cfg, at)
+        return Selection(
+            d.targetId,
+            d.turnoEs,
+            selectionDecision(d.reason, at, d.mode.name, d.targetId, d.nightId, d.n2Id)
+        )
     }
 
     private fun computeNextBoundaryAt(cfg: Map<String, Any?>, now: ZonedDateTime): ZonedDateTime {
@@ -769,7 +741,6 @@ class MainActivity : ComponentActivity() {
                     forcedReason = ov.uiReason
                 )
 
-                beginApplyWindow()
                 applyForwardingByContactName(label)
             }
         }
@@ -893,19 +864,9 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        dismissSwipeKeyguardIfNeeded {
-            handler.postDelayed({
-                dumpLockState("AFTER_DISMISS_BEFORE_DIAL")
-                dialForwarding(raw)
-            }, 250)
-        }
-    }
-
-    private fun dialForwarding(rawFromContact: String) {
-        val mmiToDial = buildForwardMmi(rawFromContact)
-
-        if (mmiToDial.isNullOrBlank()) {
-            Log.e("APPLY", "FAIL: cannot build MMI from raw='$rawFromContact'")
+        val canonicalMmi = buildForwardMmi(raw)
+        if (canonicalMmi.isNullOrBlank()) {
+            Log.e("APPLY", "FAIL: cannot build canonical MMI from raw='$raw'")
             stopApplyWindow()
 
             reportIdleStatus(
@@ -916,11 +877,20 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        Log.e("APPLY", "Dialing canonical MMI='$mmiToDial' (raw='$rawFromContact')")
+        beginApplyWindow(canonicalMmi)
 
-        applyPrefs.edit { putString(KEY_EXPECTED_MMI, mmiToDial) }
+        dismissSwipeKeyguardIfNeeded {
+            handler.postDelayed({
+                dumpLockState("AFTER_DISMISS_BEFORE_DIAL")
+                dialForwarding(canonicalMmi, raw)
+            }, 250)
+        }
+    }
 
-        val uri = Uri.parse("tel:" + Uri.encode(mmiToDial))
+    private fun dialForwarding(canonicalMmi: String, rawFromContact: String) {
+        Log.e("APPLY", "Dialing canonical MMI='$canonicalMmi' (raw='$rawFromContact')")
+
+        val uri = Uri.parse("tel:" + Uri.encode(canonicalMmi))
         val intent = Intent(Intent.ACTION_DIAL, uri).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
@@ -943,7 +913,7 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun beginApplyWindow() {
+    private fun beginApplyWindow(expectedCanonicalMmi: String) {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val now = System.currentTimeMillis()
@@ -952,13 +922,15 @@ class MainActivity : ComponentActivity() {
         applyInProgress = true
 
         applyPrefs.edit {
+            putString(KEY_EXPECTED_MMI, expectedCanonicalMmi)
             putLong(KEY_ARMED_SINCE, now)
             putLong(KEY_ARMED_WINDOW_MS, OK_TIMEOUT_MS)
             putString(KEY_LAST_RESULT, "")
             putString(KEY_LAST_TEXT, "")
             putLong(KEY_LAST_TS, 0L)
-            putString(KEY_EXPECTED_MMI, applyPrefs.getString(KEY_EXPECTED_MMI, "") ?: "")
         }
+
+        Log.e("APPLY", "BEGIN_WINDOW applyInProgress=$applyInProgress armedSince=$now expectedMmi='$expectedCanonicalMmi'")
 
         timeoutRunnable?.let { handler.removeCallbacks(it) }
         timeoutRunnable = Runnable {
