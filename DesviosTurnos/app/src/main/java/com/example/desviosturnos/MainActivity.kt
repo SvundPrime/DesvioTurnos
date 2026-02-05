@@ -136,7 +136,13 @@ class MainActivity : ComponentActivity() {
             return@OnSharedPreferenceChangeListener
         }
 
-        if (key != KEY_LAST_RESULT && key != KEY_LAST_TS && key != KEY_LAST_TEXT) {
+        if (
+            key != KEY_LAST_RESULT &&
+            key != KEY_LAST_TS &&
+            key != KEY_LAST_TEXT &&
+            key != KEY_EXPECTED_MMI &&
+            key != KEY_ARMED_SINCE
+        ) {
             Log.e("SNIFFER_LISTENER", "DROP key not relevant: $key")
             return@OnSharedPreferenceChangeListener
         }
@@ -769,7 +775,6 @@ class MainActivity : ComponentActivity() {
                     forcedReason = ov.uiReason
                 )
 
-                beginApplyWindow()
                 applyForwardingByContactName(label)
             }
         }
@@ -893,19 +898,9 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        dismissSwipeKeyguardIfNeeded {
-            handler.postDelayed({
-                dumpLockState("AFTER_DISMISS_BEFORE_DIAL")
-                dialForwarding(raw)
-            }, 250)
-        }
-    }
-
-    private fun dialForwarding(rawFromContact: String) {
-        val mmiToDial = buildForwardMmi(rawFromContact)
-
-        if (mmiToDial.isNullOrBlank()) {
-            Log.e("APPLY", "FAIL: cannot build MMI from raw='$rawFromContact'")
+        val canonicalMmi = buildForwardMmi(raw)
+        if (canonicalMmi.isNullOrBlank()) {
+            Log.e("APPLY", "FAIL: cannot build canonical MMI from raw='$raw'")
             stopApplyWindow()
 
             reportIdleStatus(
@@ -916,11 +911,20 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        Log.e("APPLY", "Dialing canonical MMI='$mmiToDial' (raw='$rawFromContact')")
+        beginApplyWindow(canonicalMmi)
 
-        applyPrefs.edit { putString(KEY_EXPECTED_MMI, mmiToDial) }
+        dismissSwipeKeyguardIfNeeded {
+            handler.postDelayed({
+                dumpLockState("AFTER_DISMISS_BEFORE_DIAL")
+                dialForwarding(canonicalMmi, raw)
+            }, 250)
+        }
+    }
 
-        val uri = Uri.parse("tel:" + Uri.encode(mmiToDial))
+    private fun dialForwarding(canonicalMmi: String, rawFromContact: String) {
+        Log.e("APPLY", "Dialing canonical MMI='$canonicalMmi' (raw='$rawFromContact')")
+
+        val uri = Uri.parse("tel:" + Uri.encode(canonicalMmi))
         val intent = Intent(Intent.ACTION_DIAL, uri).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
@@ -943,7 +947,7 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun beginApplyWindow() {
+    private fun beginApplyWindow(expectedCanonicalMmi: String) {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val now = System.currentTimeMillis()
@@ -952,13 +956,15 @@ class MainActivity : ComponentActivity() {
         applyInProgress = true
 
         applyPrefs.edit {
+            putString(KEY_EXPECTED_MMI, expectedCanonicalMmi)
             putLong(KEY_ARMED_SINCE, now)
             putLong(KEY_ARMED_WINDOW_MS, OK_TIMEOUT_MS)
             putString(KEY_LAST_RESULT, "")
             putString(KEY_LAST_TEXT, "")
             putLong(KEY_LAST_TS, 0L)
-            putString(KEY_EXPECTED_MMI, applyPrefs.getString(KEY_EXPECTED_MMI, "") ?: "")
         }
+
+        Log.e("APPLY", "BEGIN_WINDOW applyInProgress=$applyInProgress armedSince=$now expectedMmi='$expectedCanonicalMmi'")
 
         timeoutRunnable?.let { handler.removeCallbacks(it) }
         timeoutRunnable = Runnable {

