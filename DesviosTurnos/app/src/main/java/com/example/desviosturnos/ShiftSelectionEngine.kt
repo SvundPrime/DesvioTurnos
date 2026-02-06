@@ -71,6 +71,11 @@ object ShiftSelectionEngine {
 
     private fun isWeekday(dow: DayOfWeek) = dow.value in 1..5
 
+    private fun effectiveNightDay(at: ZonedDateTime): DayOfWeek {
+        val t = at.toLocalTime()
+        return if (t < LocalTime.of(7, 0)) at.minusDays(1).dayOfWeek else at.dayOfWeek
+    }
+
     private fun inRange(t: LocalTime, start: String, end: String): Boolean {
         val s = LocalTime.parse(start)
         val e = LocalTime.parse(end)
@@ -149,7 +154,8 @@ object ShiftSelectionEngine {
             return Decision(n2, "Guardia", "WEEKEND_N2_WINDOW", mode, night, n2)
         }
 
-        if (isNightDJ(dow) && inRange(t, "23:00", "07:00")) {
+        val effectiveNightDow = effectiveNightDay(at)
+        if (isNightDJ(effectiveNightDow) && inRange(t, "23:00", "07:00")) {
             val chosen = night ?: n2
             return Decision(
                 chosen,

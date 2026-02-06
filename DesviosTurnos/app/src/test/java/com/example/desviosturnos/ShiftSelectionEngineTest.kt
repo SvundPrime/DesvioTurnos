@@ -128,11 +128,27 @@ class ShiftSelectionEngineTest {
         assertEquals("NOCHE_FALLBACK_N2", d.reason)
     }
     @Test
-    fun friday0020_is_not_night_window_and_falls_default_n2() {
+    fun friday0046_keeps_thursday_night() {
         val cfg = baseConfig()
-        val d = ShiftSelectionEngine.selectAt(cfg, at("2025-01-10T00:20:00")) // Friday
-        assertEquals("N2", d.targetId)
-        assertEquals("DEFAULT_N2", d.reason)
+        val d = ShiftSelectionEngine.selectAt(cfg, at("2025-01-10T00:46:00")) // Friday
+        assertEquals("N1", d.targetId)
+        assertEquals("NOCHE", d.reason)
+    }
+
+    @Test
+    fun friday0659_keeps_thursday_night() {
+        val cfg = baseConfig()
+        val d = ShiftSelectionEngine.selectAt(cfg, at("2025-01-10T06:59:00")) // Friday
+        assertEquals("N1", d.targetId)
+        assertEquals("NOCHE", d.reason)
+    }
+
+    @Test
+    fun friday0700_exits_night_window() {
+        val cfg = baseConfig()
+        val d = ShiftSelectionEngine.selectAt(cfg, at("2025-01-10T07:00:00")) // Friday
+        assertEquals("M1", d.targetId)
+        assertEquals("MANANA", d.reason)
     }
 
     @Test
