@@ -25,6 +25,7 @@ class PopupSnifferService : AccessibilityService() {
         private const val DEFAULT_WINDOW_MS = 60_000L
         private const val CALL_CLICK_DELAY_MS = 300L
         private const val DIALER_STABLE_WINDOW_MS = 600L
+        private const val DIALER_MAX_WAIT_MS = 2_500L
         private const val MAX_CALL_CLICK_ATTEMPTS = 4
 
         private val DISMISS_BUTTON_TEXTS = listOf(
@@ -53,6 +54,10 @@ class PopupSnifferService : AccessibilityService() {
     private var pendingCallAttempt: Int = 0
     private var activeDialerPkg: String? = null
     private var lastDialerWindowAt: Long = 0L
+    private var dialerWindowFirstSeenAt: Long = 0L
+    private var lastDialerEventAt: Long = 0L
+    private var pendingCallClickArmedSince: Long? = null
+    private var pendingCallClickDueAt: Long = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -83,8 +88,13 @@ class PopupSnifferService : AccessibilityService() {
                         event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
                         event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED
                     ) {
+                        val previousPkg = activeDialerPkg
                         activeDialerPkg = pkg
                         lastDialerWindowAt = now
+                        lastDialerEventAt = now
+                        if (dialerWindowFirstSeenAt == 0L || pendingCallClickArmedSince != since || previousPkg != pkg) {
+                            dialerWindowFirstSeenAt = now
+                        }
                         Log.e(TAG, "DIALER_WINDOW event=${event.eventType} pkg=$pkg class=$clazz armedSince=$since")
                         scheduleCallClick(since, pkg, clazz)
                     }
@@ -376,21 +386,58 @@ class PopupSnifferService : AccessibilityService() {
     }
 
     private fun scheduleCallClick(armedSince: Long, pkg: String, clazz: String) {
-        pendingCallClick?.let { handler.removeCallbacks(it) }
-        pendingCallClick = Runnable {
-            val now = System.currentTimeMillis()
-            if (!ensureArmedFromPrefs(now)) return@Runnable
-            if (armedSince == lastCallClickArmedSince) return@Runnable
+        scheduleCallClick(armedSince, pkg, clazz, force = false)
+    }
 
-            val sinceWindow = now - lastDialerWindowAt
-            if (activeDialerPkg != pkg || sinceWindow < DIALER_STABLE_WINDOW_MS) {
+    private fun resetPendingCallClickState(reason: String) {
+        Log.e(TAG, "CALL_CLICK_RESET reason=$reason attempt=$pendingCallAttempt")
+        pendingCallClick?.let { handler.removeCallbacks(it) }
+        pendingCallClick = null
+        pendingCallClickArmedSince = null
+        pendingCallClickDueAt = 0L
+        pendingCallAttempt = 0
+    }
+
+    private fun scheduleCallClick(armedSince: Long, pkg: String, clazz: String, force: Boolean) {
+        val now = System.currentTimeMillis()
+        val pending = pendingCallClick
+        if (pendingCallClickArmedSince != null && pendingCallClickArmedSince != armedSince) {
+            pendingCallAttempt = 0
+        }
+        if (!force && pending != null && pendingCallClickArmedSince == armedSince && now < pendingCallClickDueAt) {
+            Log.e(TAG, "CALL_CLICK_PENDING armedSince=$armedSince pkg=$pkg dueIn=${pendingCallClickDueAt - now}ms")
+            return
+        }
+        pending?.let { handler.removeCallbacks(it) }
+
+        if (dialerWindowFirstSeenAt == 0L || pendingCallClickArmedSince != armedSince) {
+            dialerWindowFirstSeenAt = now
+        }
+
+        val runnable = Runnable {
+            val runAt = System.currentTimeMillis()
+            if (!ensureArmedFromPrefs(runAt)) {
+                Log.e(TAG, "CALL_CLICK_ABORT disarmed (armedSince=$armedSince)")
+                resetPendingCallClickState("disarmed")
+                return@Runnable
+            }
+            if (armedSince == lastCallClickArmedSince) {
+                resetPendingCallClickState("already_clicked")
+                return@Runnable
+            }
+
+            val sinceWindow = runAt - lastDialerWindowAt
+            val sinceFirstSeen = if (dialerWindowFirstSeenAt > 0L) runAt - dialerWindowFirstSeenAt else sinceWindow
+            val sinceLastEvent = if (lastDialerEventAt > 0L) runAt - lastDialerEventAt else sinceWindow
+            if (activeDialerPkg != pkg || (sinceLastEvent < DIALER_STABLE_WINDOW_MS && sinceFirstSeen < DIALER_MAX_WAIT_MS)) {
                 Log.e(
                     TAG,
-                    "CALL_CLICK_WAIT pkg=$pkg activeDialerPkg=$activeDialerPkg sinceWindow=${sinceWindow}ms attempt=$pendingCallAttempt"
+                    "CALL_CLICK_WAIT pkg=$pkg activeDialerPkg=$activeDialerPkg sinceWindow=${sinceWindow}ms " +
+                        "sinceLastEvent=${sinceLastEvent}ms sinceFirstSeen=${sinceFirstSeen}ms attempt=$pendingCallAttempt"
                 )
                 if (pendingCallAttempt < MAX_CALL_CLICK_ATTEMPTS) {
                     pendingCallAttempt += 1
-                    scheduleCallClick(armedSince, pkg, clazz)
+                    scheduleCallClick(armedSince, pkg, clazz, force = true)
                 }
                 return@Runnable
             }
@@ -399,19 +446,23 @@ class PopupSnifferService : AccessibilityService() {
             val clicked = clickCallButtonIfPresentGuarded()
             if (clicked) {
                 lastCallClickArmedSince = armedSince
-                lastCallClickAt = now
-                pendingCallAttempt = 0
+                lastCallClickAt = runAt
                 Log.e(TAG, "CALL_CLICK_SUCCESS armedSince=$armedSince pkg=$pkg")
+                resetPendingCallClickState("success")
             } else {
                 Log.e(TAG, "CALL_CLICK_NOT_FOUND armedSince=$armedSince pkg=$pkg")
                 if (pendingCallAttempt < MAX_CALL_CLICK_ATTEMPTS) {
                     pendingCallAttempt += 1
-                    scheduleCallClick(armedSince, pkg, clazz)
+                    scheduleCallClick(armedSince, pkg, clazz, force = true)
                 } else {
-                    pendingCallAttempt = 0
+                    resetPendingCallClickState("max_attempts")
                 }
             }
         }
-        handler.postDelayed(pendingCallClick!!, CALL_CLICK_DELAY_MS)
+
+        pendingCallClick = runnable
+        pendingCallClickArmedSince = armedSince
+        pendingCallClickDueAt = now + CALL_CLICK_DELAY_MS
+        handler.postDelayed(runnable, CALL_CLICK_DELAY_MS)
     }
 }
