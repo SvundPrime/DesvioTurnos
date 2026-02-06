@@ -879,7 +879,17 @@ class MainActivity : ComponentActivity() {
 
         beginApplyWindow(canonicalMmi)
 
-        dismissSwipeKeyguardIfNeeded {
+        dismissSwipeKeyguardIfNeeded { unlocked ->
+            if (!unlocked) {
+                Log.e("KEYGUARD", "Dismiss finished but still locked -> aborting dial")
+                stopApplyWindow()
+                reportIdleStatus(
+                    resultCode = "FAIL_KEYGUARD_LOCKED",
+                    resultadoEs = "Pantalla bloqueada",
+                    motivoEs = "Aplicar"
+                )
+                return@dismissSwipeKeyguardIfNeeded
+            }
             handler.postDelayed({
                 dumpLockState("AFTER_DISMISS_BEFORE_DIAL")
                 dialForwarding(canonicalMmi, raw)
@@ -1212,31 +1222,49 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun dismissSwipeKeyguardIfNeeded(onDone: () -> Unit) {
+    private fun dismissSwipeKeyguardIfNeeded(onDone: (unlocked: Boolean) -> Unit) {
         val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+        fun checkUnlocked(): Boolean = !km.isKeyguardLocked
 
-        if (km.isKeyguardLocked && !km.isKeyguardSecure) {
-            Log.e("KEYGUARD", "Requesting dismiss (swipe lock)")
-            km.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
-                override fun onDismissSucceeded() {
-                    Log.e("KEYGUARD", "Dismiss succeeded")
-                    onDone()
-                }
-
-                override fun onDismissCancelled() {
-                    Log.e("KEYGUARD", "Dismiss cancelled")
-                    onDone()
-                }
-
-                override fun onDismissError() {
-                    Log.e("KEYGUARD", "Dismiss error")
-                    onDone()
-                }
-            })
+        if (!km.isKeyguardLocked || km.isKeyguardSecure) {
+            onDone(true)
             return
         }
 
-        onDone()
+        Log.e("KEYGUARD", "Requesting dismiss (swipe lock)")
+
+        var finished = false
+        val handler = Handler(Looper.getMainLooper())
+
+        fun finish(tag: String) {
+            if (finished) return
+            finished = true
+            handler.removeCallbacksAndMessages(null)
+            val unlocked = checkUnlocked()
+            Log.e("KEYGUARD", "Finish($tag) unlocked=$unlocked keyguardLocked=${km.isKeyguardLocked}")
+            onDone(unlocked)
+        }
+
+        handler.postDelayed({
+            finish("timeout")
+        }, 2500L)
+
+        km.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+            override fun onDismissSucceeded() {
+                Log.e("KEYGUARD", "Dismiss succeeded")
+                finish("succeeded")
+            }
+
+            override fun onDismissCancelled() {
+                Log.e("KEYGUARD", "Dismiss cancelled")
+                finish("cancelled")
+            }
+
+            override fun onDismissError() {
+                Log.e("KEYGUARD", "Dismiss error")
+                finish("error")
+            }
+        })
     }
 
     private fun isWeekendN2Window(at: ZonedDateTime): Boolean {
