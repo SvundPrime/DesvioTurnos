@@ -7,6 +7,7 @@ import {
   getDocs,
   onSnapshot,
   query,
+  runTransaction,
   serverTimestamp,
   setDoc,
   writeBatch,
@@ -40,6 +41,7 @@ const DEVICES = {
 };
 
 const DEVICE_LIST = [DEVICES.REDIRIS, DEVICES.TELEFONICA];
+const LOCK_TTL_MS = 120_000;
 
 const THEME = {
   bg: "#07131A",
@@ -186,6 +188,15 @@ function badgeForApplySource(source, styles) {
   if (s === "MANUAL") return { ...styles.badge, borderColor: "rgba(255,176,32,0.55)", color: THEME.warn };
   if (s === "FORCED") return { ...styles.badge, borderColor: "rgba(231,76,60,0.6)", color: "#ffb3a7" };
   return { ...styles.badge, borderColor: "rgba(255,255,255,0.16)", color: THEME.muted };
+}
+
+function isDeviceBusy(d) {
+  if (!d) return false;
+  const statusRunning = String(d.status || "").toLowerCase() === "running";
+  const lock = d.applyLock;
+  const now = Date.now();
+  const lockActive = lock?.locked && typeof lock?.expiresAt === "number" && lock.expiresAt > now;
+  return statusRunning || lockActive;
 }
 
 function badgeForLog(l, styles) {
@@ -609,16 +620,89 @@ export default function App() {
     [contacts]
   );
 
+  const busyRediris = isDeviceBusy(redirisState);
+  const busyTelefonica = isDeviceBusy(telefonicaState);
+  const busyAny = busyRediris || busyTelefonica;
+
   async function login(e) {
     e.preventDefault();
     await signInWithEmailAndPassword(auth, email, pass);
   }
 
+  async function acquireLockOrThrow(deviceId, lockId) {
+    const ref = doc(db, "devices", deviceId);
+
+    await runTransaction(db, async (tx) => {
+      const snap = await tx.get(ref);
+      const data = snap.exists() ? snap.data() : {};
+      const lock = data?.applyLock;
+
+      const now = Date.now();
+      const active = lock?.locked && typeof lock?.expiresAt === "number" && lock.expiresAt > now;
+      if (active) {
+        const who = lock?.lockedBy || "otro usuario";
+        throw new Error(`DISPOSITIVO_OCUPADO:${deviceId}:${who}`);
+      }
+
+      tx.set(ref, {
+        applyLock: {
+          locked: true,
+          lockId,
+          lockedBy: user.email,
+          lockedAt: serverTimestamp(),
+          expiresAt: now + LOCK_TTL_MS,
+        },
+        status: "running",
+        resultCode: "LOCKED_BY_WEB",
+        resultado: "Aplicando...",
+        motivo: "Bloqueo preventivo (web)",
+        statusReason: "Bloqueo preventivo (web)",
+        lastAt: serverTimestamp(),
+      }, { merge: true });
+    });
+  }
+
+  async function releaseLockIfOwned(deviceId, lockId) {
+    const ref = doc(db, "devices", deviceId);
+    await runTransaction(db, async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists()) return;
+      const lock = snap.data()?.applyLock;
+      if (!lock?.locked || lock?.lockId !== lockId || lock?.lockedBy !== user.email) return;
+      tx.set(ref, {
+        applyLock: {
+          locked: false,
+          lockId,
+          lockedBy: user.email,
+          lockedAt: serverTimestamp(),
+          expiresAt: 0,
+        },
+      }, { merge: true });
+    });
+  }
+
+  async function acquireLocksForBoth(lockId) {
+    const acquired = [];
+    try {
+      for (const deviceId of DEVICE_LIST) {
+        await acquireLockOrThrow(deviceId, lockId);
+        acquired.push(deviceId);
+      }
+    } catch (e) {
+      await Promise.all(acquired.map((deviceId) => releaseLockIfOwned(deviceId, lockId)));
+      throw e;
+    }
+  }
+
   async function forceNextTurnBoth() {
     try {
       if (!user) return;
+      setBusyApply(true);
 
       const requestId = makeRequestId();
+      const lockId = `web-force-${requestId}`;
+      await acquireLocksForBoth(lockId);
+
       const batch = writeBatch(db);
 
       for (const deviceId of DEVICE_LIST) {
@@ -643,6 +727,7 @@ export default function App() {
             requestId: `force-next-${requestId}`,
             requestedBy: user.email,
             requestedAt: serverTimestamp(),
+            lockId,
           },
           { merge: true }
         );
@@ -660,7 +745,14 @@ export default function App() {
       await batch.commit();
     } catch (e) {
       console.error("ERROR forceNextTurnBoth:", e);
-      alert("Error al forzar el siguiente turno: " + (e?.message ?? e));
+      const msg = String(e?.message ?? e);
+      if (msg.startsWith("DISPOSITIVO_OCUPADO:")) {
+        alert("Hay una aplicación en curso. No puedes pisarla.");
+      } else {
+        alert("Error al forzar el siguiente turno: " + msg);
+      }
+    } finally {
+      setBusyApply(false);
     }
   }
 
@@ -679,11 +771,15 @@ export default function App() {
       setBusyApply(true);
 
       const requestId = makeRequestId();
+      const lockId = `web-${requestId}`;
+      await acquireLocksForBoth(lockId);
+
       const payload = {
         action: "APPLY_NOW",
         requestId,
         requestedBy: user.email,
         requestedAt: serverTimestamp(),
+        lockId,
       };
 
       await Promise.all([
@@ -700,7 +796,12 @@ export default function App() {
       });
     } catch (e) {
       console.error("ERROR applyNowBoth:", e);
-      alert("Error al enviar el comando: " + (e?.message ?? e));
+      const msg = String(e?.message ?? e);
+      if (msg.startsWith("DISPOSITIVO_OCUPADO:")) {
+        alert("Hay una aplicación en curso. No puedes pisarla.");
+      } else {
+        alert("Error al enviar el comando: " + msg);
+      }
     } finally {
       setBusyApply(false);
     }
@@ -870,11 +971,12 @@ export default function App() {
 
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <button
-              style={{ ...styles.primaryBtn, width: "auto" }}
+              style={{ ...styles.primaryBtn, width: "auto", opacity: busyApply || busyAny ? 0.7 : 1 }}
               onClick={forceNextTurnBoth}
-              title="Fuerza el paso al siguiente turno en ambos móviles y aplica ahora"
+              disabled={busyApply || busyAny}
+              title={busyAny ? "Hay un proceso de aplicación en curso" : "Fuerza el paso al siguiente turno en ambos móviles y aplica ahora"}
             >
-              Siguiente turno ahora (ambos)
+              {busyAny ? "Ocupado (aplicando…)" : "Siguiente turno ahora (ambos)"}
             </button>
 
             <div
@@ -889,13 +991,13 @@ export default function App() {
                 style={{
                   ...styles.primaryBtn,
                   width: "100%",
-                  opacity: busyApply ? 0.7 : 1,
+                  opacity: busyApply || busyAny ? 0.7 : 1,
                 }}
                 onClick={applyNowBoth}
-                disabled={busyApply}
-                title="Envía el comando de aplicación inmediata a ambos móviles"
+                disabled={busyApply || busyAny}
+                title={busyAny ? "Hay un proceso de aplicación en curso" : "Envía el comando"}
               >
-                {busyApply ? "Enviando…" : "Aplicar ahora (ambos)"}
+                {busyAny ? "Ocupado (aplicando…)" : busyApply ? "Enviando…" : "Aplicar ahora (ambos)"}
               </button>
 
               <button style={styles.ghostBtn} onClick={() => signOut(auth)}>
@@ -1232,6 +1334,11 @@ function DeviceCard({ title, data, styles }) {
     typeof data?.nextChangeAt === "number"
       ? new Date(data.nextChangeAt).toLocaleString()
       : "-";
+  const lockBy = data?.applyLock?.lockedBy ?? "-";
+  const lockUntil =
+    typeof data?.applyLock?.expiresAt === "number" && data.applyLock.expiresAt > 0
+      ? new Date(data.applyLock.expiresAt).toLocaleString()
+      : "-";
 
   return (
     <div style={styles.deviceCard}>
@@ -1245,6 +1352,8 @@ function DeviceCard({ title, data, styles }) {
         <KV k="Destino" v={target} />
         <KV k="Turno" v={turno} />
         <KV k="Próximo cambio" v={nextChangeStr} />
+        <KV k="Lock por" v={lockBy} />
+        <KV k="Lock hasta" v={lockUntil} />
         <KV
           k="Motivo"
           v={(
