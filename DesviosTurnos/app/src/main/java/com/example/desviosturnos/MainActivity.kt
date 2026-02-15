@@ -84,6 +84,8 @@ class MainActivity : ComponentActivity() {
         const val KEY_ARMED_WINDOW_MS = "armed_window_ms"
         const val KEY_EXPECTED_MMI = "expected_mmi"
         const val OK_TIMEOUT_MS = 60_000L
+        const val APPLY_LOCK_TTL_MS = 120_000L
+        const val APPLY_LOCK_HEARTBEAT_MS = 20_000L
         const val RETRY_DELAY_MS = 1_200L
         const val APPLY_SOURCE_AUTO = "AUTO"
         const val APPLY_SOURCE_MANUAL = "MANUAL"
@@ -111,7 +113,9 @@ class MainActivity : ComponentActivity() {
     private var applyStartMs: Long = 0L
     private var timeoutRunnable: Runnable? = null
     private var retryRunnable: Runnable? = null
+    private var lockHeartbeatRunnable: Runnable? = null
     private var lastStatusFingerprint: String? = null
+    private var currentLockId: String? = null
 
     private var lastProcessedRequestId: String?
         get() = prefs.getString("last_request_id", null)
@@ -169,7 +173,7 @@ class MainActivity : ComponentActivity() {
         when (result) {
             "OK" -> {
                 Log.e("SNIFFER_LISTENER", "CASE OK -> stopApplyWindow + report + bringToFront")
-                stopApplyWindow()
+                stopApplyWindow(keepLock = false)
 
                 reportDeviceStatus(
                     status = "idle",
@@ -191,7 +195,7 @@ class MainActivity : ComponentActivity() {
 
             "FAIL", "FAIL_MIXED" -> {
                 Log.e("SNIFFER_LISTENER", "CASE $result -> stopApplyWindow + scheduleRetry")
-                stopApplyWindow()
+                stopApplyWindow(keepLock = true)
 
                 scheduleRetry(
                     reasonCode = "POPUP_$result",
@@ -204,7 +208,7 @@ class MainActivity : ComponentActivity() {
 
             "UNKNOWN" -> {
                 Log.e("SNIFFER_LISTENER", "CASE UNKNOWN -> stopApplyWindow + scheduleRetry (conservador)")
-                stopApplyWindow()
+                stopApplyWindow(keepLock = true)
 
                 scheduleRetry(
                     reasonCode = "POPUP_UNKNOWN",
@@ -240,7 +244,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         applyPrefs.unregisterOnSharedPreferenceChangeListener(snifferListener)
-        stopApplyWindow()
+        stopApplyWindow(keepLock = false)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -513,9 +517,25 @@ class MainActivity : ComponentActivity() {
                 if (requestId == lastProcessedRequestId) return@addSnapshotListener
 
                 if (applyInProgress) {
-                    Log.d("APPLY", "Ignoring APPLY_NOW requestId=$requestId because applyInProgress=true")
+                    Log.d("APPLY", "Reject APPLY_NOW requestId=$requestId because applyInProgress=true")
+                    reportDeviceStatus(
+                        status = "running",
+                        resultCode = "BUSY_REJECT",
+                        resultadoEs = "Solicitud rechazada",
+                        motivoEs = "Rechazado: aplicación en curso",
+                        lastTargetId = lastTargetId,
+                        lastTargetName = lastTargetName,
+                        nextTargetId = nextTargetId,
+                        nextTargetName = nextTargetName,
+                        nextChangeAt = nextChangeAt,
+                        turnoEs = refreshShiftNow(),
+                        forced = lastWasForced,
+                        forcedReason = lastForcedReason
+                    )
                     return@addSnapshotListener
                 }
+
+                val lockId = snap.getString("lockId")?.trim().takeUnless { it.isNullOrBlank() }
 
                 lastProcessedRequestId = requestId
                 lastWasForced = false
@@ -545,7 +565,8 @@ class MainActivity : ComponentActivity() {
                     {
                         applyNowFromConfig(
                             trigger = APPLY_TRIGGER_REMOTE_CMD,
-                            triggerRequestId = requestId
+                            triggerRequestId = requestId,
+                            requestedLockId = lockId
                         )
                     },
                     400
@@ -620,7 +641,7 @@ class MainActivity : ComponentActivity() {
         Log.d("ALARM", "AUTO_BOUNDARY scheduled at=$at epoch=${at.toInstant().toEpochMilli()}")
     }
 
-    private fun applyNowFromConfig(trigger: String, triggerRequestId: String? = null) {
+    private fun applyNowFromConfig(trigger: String, triggerRequestId: String? = null, requestedLockId: String? = null) {
         ensureScreenOn()
         dumpLockState("APPLY_NOW_START")
 
@@ -629,7 +650,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         cancelRetry()
-        setApplyContext(trigger = trigger, triggerRequestId = triggerRequestId)
+        setApplyContext(trigger = trigger, triggerRequestId = triggerRequestId, requestedLockId = requestedLockId)
 
         val cfg = cachedConfig
         if (cfg == null) {
@@ -647,7 +668,8 @@ class MainActivity : ComponentActivity() {
         setApplyContext(
             trigger = trigger,
             triggerRequestId = triggerRequestId,
-            overrideUi = ov
+            overrideUi = ov,
+            requestedLockId = requestedLockId
         )
 
         val nextAt = computeNextBoundaryAt(cfg, now)
@@ -715,7 +737,7 @@ class MainActivity : ComponentActivity() {
                     forcedReason = ov.uiReason
                 )
                 setUiTarget(curNameUi, nextId ?: "—", curSel.turnoEs)
-                stopApplyWindow()
+                stopApplyWindow(keepLock = false)
                 return@resolveContactData
             }
 
@@ -854,7 +876,7 @@ class MainActivity : ComponentActivity() {
 
         if (raw == null) {
             Toast.makeText(this, "No encuentro el contacto: $contactName", Toast.LENGTH_LONG).show()
-            stopApplyWindow()
+            stopApplyWindow(keepLock = false)
 
             reportIdleStatus(
                 resultCode = "FAIL_CONTACT_NOT_FOUND",
@@ -867,7 +889,7 @@ class MainActivity : ComponentActivity() {
         val canonicalMmi = buildForwardMmi(raw)
         if (canonicalMmi.isNullOrBlank()) {
             Log.e("APPLY", "FAIL: cannot build canonical MMI from raw='$raw'")
-            stopApplyWindow()
+            stopApplyWindow(keepLock = false)
 
             reportIdleStatus(
                 resultCode = "FAIL_BAD_NUMBER",
@@ -920,6 +942,7 @@ class MainActivity : ComponentActivity() {
 
         applyStartMs = now
         applyInProgress = true
+        adoptOrRenewApplyLock()
 
         applyPrefs.edit {
             putString(KEY_EXPECTED_MMI, expectedCanonicalMmi)
@@ -946,17 +969,91 @@ class MainActivity : ComponentActivity() {
         handler.postDelayed(timeoutRunnable!!, OK_TIMEOUT_MS)
     }
 
-    private fun stopApplyWindow() {
+    private fun stopApplyWindow(keepLock: Boolean) {
         applyInProgress = false
         applyStartMs = 0L
         timeoutRunnable?.let { handler.removeCallbacks(it) }
         timeoutRunnable = null
+        lockHeartbeatRunnable?.let { handler.removeCallbacks(it) }
+        lockHeartbeatRunnable = null
         applyPrefs.edit {
             putLong(KEY_ARMED_SINCE, 0L)
             putString(KEY_EXPECTED_MMI, "")
         }
+        if (!keepLock) {
+            releaseApplyLockIfOwned()
+        }
         releaseWakeLock()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun adoptOrRenewApplyLock() {
+        val lockId = currentLockId ?: currentApplyContext?.id ?: newApplyId("android")
+        currentLockId = lockId
+        val now = System.currentTimeMillis()
+
+        db.collection("devices").document(DEVICE_ID)
+            .set(
+                mapOf(
+                    "applyLock" to mapOf(
+                        "locked" to true,
+                        "lockId" to lockId,
+                        "lockedBy" to "ANDROID",
+                        "lockedAt" to FieldValue.serverTimestamp(),
+                        "expiresAt" to now + APPLY_LOCK_TTL_MS
+                    )
+                ),
+                SetOptions.merge()
+            )
+
+        scheduleLockHeartbeat(lockId)
+    }
+
+    private fun scheduleLockHeartbeat(lockId: String) {
+        lockHeartbeatRunnable?.let { handler.removeCallbacks(it) }
+        lockHeartbeatRunnable = Runnable {
+            if (!applyInProgress || currentLockId != lockId) return@Runnable
+            db.collection("devices").document(DEVICE_ID)
+                .set(
+                    mapOf(
+                        "applyLock" to mapOf(
+                            "locked" to true,
+                            "lockId" to lockId,
+                            "lockedBy" to "ANDROID",
+                            "expiresAt" to (System.currentTimeMillis() + APPLY_LOCK_TTL_MS)
+                        )
+                    ),
+                    SetOptions.merge()
+                )
+            scheduleLockHeartbeat(lockId)
+        }
+        handler.postDelayed(lockHeartbeatRunnable!!, APPLY_LOCK_HEARTBEAT_MS)
+    }
+
+    private fun releaseApplyLockIfOwned() {
+        val lockId = currentLockId ?: return
+        db.collection("devices").document(DEVICE_ID).get()
+            .addOnSuccessListener { snap ->
+                val lock = snap.get("applyLock") as? Map<*, *> ?: return@addOnSuccessListener
+                val existingId = lock["lockId"] as? String
+                val lockedBy = lock["lockedBy"] as? String
+                if (existingId != lockId || lockedBy != "ANDROID") return@addOnSuccessListener
+
+                db.collection("devices").document(DEVICE_ID)
+                    .set(
+                        mapOf(
+                            "applyLock" to mapOf(
+                                "locked" to false,
+                                "lockId" to lockId,
+                                "lockedBy" to "ANDROID",
+                                "releasedAt" to FieldValue.serverTimestamp(),
+                                "expiresAt" to System.currentTimeMillis()
+                            )
+                        ),
+                        SetOptions.merge()
+                    )
+            }
+        currentLockId = null
     }
 
     private fun bringAppToFront() {
@@ -1000,7 +1097,7 @@ class MainActivity : ComponentActivity() {
         wakeScreen()
         acquireWakeLock(15_000L)
 
-        stopApplyWindow()
+        stopApplyWindow(keepLock = true)
 
         retryRunnable = Runnable {
             acquireWakeLock(15_000L)
@@ -1114,7 +1211,8 @@ class MainActivity : ComponentActivity() {
     private fun setApplyContext(
         trigger: String,
         triggerRequestId: String? = null,
-        overrideUi: OverrideUi? = null
+        overrideUi: OverrideUi? = null,
+        requestedLockId: String? = null
     ) {
         val existing = currentApplyContext
         val baseId = when {
@@ -1137,6 +1235,7 @@ class MainActivity : ComponentActivity() {
         }
 
         currentApplyContext = ApplyContext(source, trigger, resolvedId)
+        currentLockId = requestedLockId ?: resolvedId
     }
 
     private fun newApplyId(prefix: String): String {
