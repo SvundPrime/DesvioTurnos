@@ -1,21 +1,22 @@
 import { useEffect, useMemo, useState } from "react";
-import { addDoc, orderBy, limit } from "firebase/firestore";
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from "firebase/auth";
 import {
+  addDoc,
   collection,
   doc,
   getDocs,
+  limit,
   onSnapshot,
+  orderBy,
   query,
+  runTransaction,
   serverTimestamp,
   setDoc,
-  writeBatch,
   where,
+  writeBatch,
 } from "firebase/firestore";
 import { auth, db } from "./firebase";
 import SelectControl from "./SelectControl";
-
-
 
 const NONE = "__NONE__";
 const DAYS_LV = ["MON", "TUE", "WED", "THU", "FRI"];
@@ -57,6 +58,7 @@ const THEME = {
   ok: "#2EE59D",
   shadow: "0 10px 30px rgba(0,0,0,0.35)",
 };
+
 const ACTION_ES = {
   APPLY_NOW: "Aplicar ahora",
 };
@@ -65,8 +67,6 @@ function prettyAction(a) {
   const k = String(a || "").toUpperCase();
   return ACTION_ES[k] || a || "-";
 }
-
-
 
 const isNoneLike = (v) => {
   if (v == null) return true;
@@ -77,6 +77,7 @@ const toNullableId = (v) => (isNoneLike(v) ? null : String(v).trim());
 const toSelectValue = (v) => (isNoneLike(v) ? NONE : String(v).trim());
 
 const makeRequestId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
 function cleanCfg(cfg) {
   const mode = Object.values(MODE).includes(String(cfg?.mode || "").toUpperCase())
     ? String(cfg.mode).toUpperCase()
@@ -111,14 +112,15 @@ function normalizeCfg(data) {
   const legacyN1Active = (data?.n1Active ?? true) === true;
 
   const inferredMode =
-    legacyHoliday ? MODE.FESTIVO
-    : legacyOffice ? MODE.OFICINA
-    : legacyN1Active ? MODE.NORMAL
-    : MODE.FESTIVO;
+    legacyHoliday ? MODE.FESTIVO :
+    legacyOffice ? MODE.OFICINA :
+    legacyN1Active ? MODE.NORMAL :
+    MODE.FESTIVO;
 
   const finalMode = safeMode || inferredMode;
+
   const intershiftOld = data?.shifts?.intershift?.contactId;
-  const intershiftLJ  = data?.shifts?.intershiftLJ?.contactId;
+  const intershiftLJ = data?.shifts?.intershiftLJ?.contactId;
   const intershiftFri = data?.shifts?.intershiftFri?.contactId;
 
   const pickIntershift =
@@ -195,8 +197,6 @@ function badgeForLog(l, styles) {
   return { ...styles.badge, borderColor: "rgba(255,255,255,0.16)", color: THEME.text2 };
 }
 
-
-
 function useMediaQuery(queryStr) {
   const [matches, setMatches] = useState(() => {
     if (typeof window === "undefined") return false;
@@ -215,8 +215,6 @@ function useMediaQuery(queryStr) {
   return matches;
 }
 
-
-
 function makeStyles(isMobile) {
   const pagePad = isMobile ? 12 : 24;
   const shellPad = isMobile ? "0 6px" : "0 16px";
@@ -233,9 +231,7 @@ function makeStyles(isMobile) {
       padding: pagePad,
       fontFamily:
         'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif',
-      ...(isMobile
-        ? { display: "grid", justifyItems: "center" }
-        : {}),
+      ...(isMobile ? { display: "grid", justifyItems: "center" } : {}),
     },
     shell: {
       width: "100%",
@@ -257,9 +253,7 @@ function makeStyles(isMobile) {
       justifyContent: "space-between",
       alignItems: "center",
       gap: 16,
-      ...(isMobile
-        ? { flexDirection: "column", alignItems: "stretch", gap: 12 }
-        : {}),
+      ...(isMobile ? { flexDirection: "column", alignItems: "stretch", gap: 12 } : {}),
     },
 
     gridMain: {
@@ -337,6 +331,7 @@ function makeStyles(isMobile) {
       gap: 12,
       padding: isMobile ? "8px 0" : "10px 0",
     },
+
     primaryBtn: {
       width: "100%",
       padding: isMobile ? "11px 12px" : "12px 14px",
@@ -472,7 +467,6 @@ function makeStyles(isMobile) {
   };
 }
 
-
 function getRadixSelectStyles(isMobile) {
   return {
     trigger: {
@@ -524,15 +518,82 @@ function getRadixSelectStyles(isMobile) {
   };
 }
 
+/** ---------------- DISPLAY HELPERS (EMAIL -> ALIAS) ---------------- */
+function shortUser(s) {
+  const v = String(s || "").trim();
+  if (!v) return "desconocido";
+  return v.split("@")[0];
+}
 
+/** ---------------- LOCK HELPERS ---------------- */
+const LOCK_TTL_MS = 120_000; // 2 min
 
+function isDeviceLocked(data) {
+  const lock = data?.applyLock;
+  const now = Date.now();
+  return !!(lock?.locked && typeof lock?.expiresAt === "number" && lock.expiresAt > now);
+}
+
+function isDeviceBusy(data) {
+  const statusRunning = String(data?.status || "").toLowerCase() === "running";
+  return statusRunning || isDeviceLocked(data);
+}
+
+function lockInfoText(data) {
+  const lock = data?.applyLock;
+  if (!lock?.locked) return null;
+  const exp = typeof lock.expiresAt === "number" ? new Date(lock.expiresAt).toLocaleString() : "-";
+  const who = shortUser(lock.lockedBy);
+  return `Bloqueado por ${who} hasta ${exp}`;
+}
+
+async function acquireDeviceLockOrThrow({ deviceId, lockId, reason, userEmail }) {
+  const ref = doc(db, "devices", deviceId);
+
+  await runTransaction(db, async (tx) => {
+    const snap = await tx.get(ref);
+    const data = snap.exists() ? snap.data() : {};
+    const lock = data?.applyLock;
+
+    const now = Date.now();
+    const active = !!(lock?.locked && typeof lock?.expiresAt === "number" && lock.expiresAt > now);
+
+    if (active) {
+      const who = lock?.lockedBy || "otro usuario";
+      throw new Error(`DEVICE_BUSY:${deviceId}:${who}`);
+    }
+
+    tx.set(
+      ref,
+      {
+        applyLock: {
+          locked: true,
+          lockId,
+          lockedBy: userEmail || "unknown",
+          lockedAt: serverTimestamp(),
+          expiresAt: now + LOCK_TTL_MS,
+          reason: reason || "apply_now",
+        },
+        status: "running",
+        statusReason: "Aplicando (bloqueo web)",
+        lastAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+}
+
+/** ---------------- APP ---------------- */
 export default function App() {
   const [user, setUser] = useState(null);
   const [email, setEmail] = useState("");
   const [pass, setPass] = useState("");
+
   const [contacts, setContacts] = useState([]);
+
   const [redirisState, setRedirisState] = useState(null);
   const [telefonicaState, setTelefonicaState] = useState(null);
+
   const [cfgRediris, setCfgRediris] = useState(makeEmptyCfg());
   const [cfgTelefonica, setCfgTelefonica] = useState(makeEmptyCfg());
 
@@ -546,6 +607,7 @@ export default function App() {
   const radixSelectStyles = useMemo(() => getRadixSelectStyles(isMobile), [isMobile]);
 
   useEffect(() => onAuthStateChanged(auth, setUser), []);
+
   useEffect(() => {
     if (!user) return;
     (async () => {
@@ -556,6 +618,7 @@ export default function App() {
       setContacts(list);
     })();
   }, [user]);
+
   useEffect(() => {
     if (!user) return;
     const unsubscribers = [
@@ -566,10 +629,9 @@ export default function App() {
         if (s.exists()) setCfgTelefonica(normalizeCfg(s.data()));
       }),
     ];
-    return () => {
-      unsubscribers.forEach((unsub) => unsub());
-    };
+    return () => unsubscribers.forEach((unsub) => unsub());
   }, [user]);
+
   useEffect(() => {
     if (!user) return;
     const unsubscribers = [
@@ -580,10 +642,9 @@ export default function App() {
         setTelefonicaState(s.exists() ? s.data() : null)
       ),
     ];
-    return () => {
-      unsubscribers.forEach((unsub) => unsub());
-    };
+    return () => unsubscribers.forEach((unsub) => unsub());
   }, [user]);
+
   useEffect(() => {
     if (!user) return;
     const q = query(collection(db, "auditLogs"), orderBy("at", "desc"), limit(10));
@@ -591,6 +652,7 @@ export default function App() {
       setLogs(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
     });
   }, [user]);
+
   const optionsN1Rediris = useMemo(
     () => buildOptionsForDevice(contacts, DEVICES.REDIRIS, "N1", true),
     [contacts]
@@ -599,7 +661,6 @@ export default function App() {
     () => buildOptionsForDevice(contacts, DEVICES.REDIRIS, "N2", false),
     [contacts]
   );
-
   const optionsN1Telefonica = useMemo(
     () => buildOptionsForDevice(contacts, DEVICES.TELEFONICA, "N1", true),
     [contacts]
@@ -609,61 +670,24 @@ export default function App() {
     [contacts]
   );
 
+  // ✅ BUSY CORRECTO: dentro del componente, recalcula con snapshots
+  const busyRediris = useMemo(() => isDeviceBusy(redirisState), [redirisState]);
+  const busyTelefonica = useMemo(() => isDeviceBusy(telefonicaState), [telefonicaState]);
+  const busyAnyDevice = busyRediris || busyTelefonica;
+
+  const busyHint = useMemo(() => {
+    if (!busyAnyDevice) return "Envía el comando de aplicación inmediata a ambos móviles";
+    const parts = [
+      busyRediris ? `RedIRIS: ${lockInfoText(redirisState) || "ocupado"}` : null,
+      busyTelefonica ? `Telefónica: ${lockInfoText(telefonicaState) || "ocupado"}` : null,
+    ].filter(Boolean);
+    return parts.join(" · ");
+  }, [busyAnyDevice, busyRediris, busyTelefonica, redirisState, telefonicaState]);
+
   async function login(e) {
     e.preventDefault();
     await signInWithEmailAndPassword(auth, email, pass);
   }
-
-  async function forceNextTurnBoth() {
-    try {
-      if (!user) return;
-
-      const requestId = makeRequestId();
-      const batch = writeBatch(db);
-
-      for (const deviceId of DEVICE_LIST) {
-        batch.set(
-          doc(db, "config", deviceId),
-          {
-            override: {
-              forceNextTurn: true,
-              forceRequestId: requestId,
-              uiTag: "FORZADO",
-              uiReason: "Siguiente turno ahora",
-              requestedBy: user.email,
-              requestedAt: serverTimestamp(),
-            },
-          },
-          { merge: true }
-        );
-        batch.set(
-          doc(db, "commands", deviceId),
-          {
-            action: "APPLY_NOW",
-            requestId: `force-next-${requestId}`,
-            requestedBy: user.email,
-            requestedAt: serverTimestamp(),
-          },
-          { merge: true }
-        );
-      }
-      batch.set(doc(collection(db, "auditLogs")), {
-        type: "OVERRIDE",
-        scope: "AMBOS",
-        action: "FORCE_NEXT_TURN",
-        actionEs: "Forzar siguiente turno",
-        requestId,
-        userEmail: user.email,
-        at: serverTimestamp(),
-      });
-
-      await batch.commit();
-    } catch (e) {
-      console.error("ERROR forceNextTurnBoth:", e);
-      alert("Error al forzar el siguiente turno: " + (e?.message ?? e));
-    }
-  }
-
 
   async function addAuditLog(entry) {
     await addDoc(collection(db, "auditLogs"), {
@@ -676,12 +700,39 @@ export default function App() {
   async function applyNowBoth() {
     try {
       if (!user) return;
+
+      // ✅ bloqueo UX inmediato (además del lock transaccional)
+      if (busyAnyDevice) {
+        alert(busyHint);
+        return;
+      }
+
       setBusyApply(true);
 
       const requestId = makeRequestId();
+      const lockId = `web-${requestId}`;
+
+      // 1) Lock transaccional: si alguno está ocupado, NO manda comandos
+      await Promise.all([
+        acquireDeviceLockOrThrow({
+          deviceId: DEVICES.REDIRIS,
+          lockId,
+          reason: "apply_now_both",
+          userEmail: user.email,
+        }),
+        acquireDeviceLockOrThrow({
+          deviceId: DEVICES.TELEFONICA,
+          lockId,
+          reason: "apply_now_both",
+          userEmail: user.email,
+        }),
+      ]);
+
+      // 2) Mandar comando con lockId (Android lo adopta)
       const payload = {
         action: "APPLY_NOW",
         requestId,
+        lockId,
         requestedBy: user.email,
         requestedAt: serverTimestamp(),
       };
@@ -700,9 +751,102 @@ export default function App() {
       });
     } catch (e) {
       console.error("ERROR applyNowBoth:", e);
+
+      const msg = String(e?.message || e);
+      if (msg.startsWith("DEVICE_BUSY:")) {
+        const [, deviceId, who] = msg.split(":");
+        alert(`No se puede aplicar: ${deviceId} está ocupado (lock por ${shortUser(who) || "otro usuario"}).`);
+        return;
+      }
+
       alert("Error al enviar el comando: " + (e?.message ?? e));
     } finally {
       setBusyApply(false);
+    }
+  }
+
+  async function forceNextTurnBoth() {
+    try {
+      if (!user) return;
+
+      if (busyAnyDevice) {
+        alert(busyHint);
+        return;
+      }
+
+      const requestId = makeRequestId();
+      const lockId = `web-force-${requestId}`;
+
+      // 1) Lock primero
+      await Promise.all([
+        acquireDeviceLockOrThrow({
+          deviceId: DEVICES.REDIRIS,
+          lockId,
+          reason: "force_next_turn",
+          userEmail: user.email,
+        }),
+        acquireDeviceLockOrThrow({
+          deviceId: DEVICES.TELEFONICA,
+          lockId,
+          reason: "force_next_turn",
+          userEmail: user.email,
+        }),
+      ]);
+
+      // 2) Override + comando APPLY_NOW
+      const batch = writeBatch(db);
+
+      for (const deviceId of DEVICE_LIST) {
+        batch.set(
+          doc(db, "config", deviceId),
+          {
+            override: {
+              forceNextTurn: true,
+              forceRequestId: requestId,
+              uiTag: "FORZADO",
+              uiReason: "Siguiente turno ahora",
+              requestedBy: user.email,
+              requestedAt: serverTimestamp(),
+            },
+          },
+          { merge: true }
+        );
+
+        batch.set(
+          doc(db, "commands", deviceId),
+          {
+            action: "APPLY_NOW",
+            requestId: `force-next-${requestId}`,
+            lockId,
+            requestedBy: user.email,
+            requestedAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
+
+      batch.set(doc(collection(db, "auditLogs")), {
+        type: "OVERRIDE",
+        scope: "AMBOS",
+        action: "FORCE_NEXT_TURN",
+        actionEs: "Forzar siguiente turno",
+        requestId,
+        userEmail: user.email,
+        at: serverTimestamp(),
+      });
+
+      await batch.commit();
+    } catch (e) {
+      console.error("ERROR forceNextTurnBoth:", e);
+
+      const msg = String(e?.message || e);
+      if (msg.startsWith("DEVICE_BUSY:")) {
+        const [, deviceId, who] = msg.split(":");
+        alert(`No se puede forzar: ${deviceId} está ocupado (lock por ${shortUser(who) || "otro usuario"}).`);
+        return;
+      }
+
+      alert("Error al forzar el siguiente turno: " + (e?.message ?? e));
     }
   }
 
@@ -722,6 +866,7 @@ export default function App() {
       const officeMode = mode === MODE.OFICINA;
       const forceHoliday = mode === MODE.FESTIVO;
       const n1Active = mode === MODE.NORMAL;
+
       const cleanedShifts =
         mode === MODE.OFICINA
           ? { ...safeCfg.shifts, morning: NONE, afternoon: NONE, night: NONE }
@@ -764,7 +909,6 @@ export default function App() {
             days: ["FRI"],
             contactId: intershiftId,
           },
-
           afternoon: {
             start: "15:00",
             end: "23:00",
@@ -832,6 +976,7 @@ export default function App() {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
               />
+
               <label style={styles.label}>Contraseña</label>
               <input
                 style={styles.input}
@@ -840,14 +985,13 @@ export default function App() {
                 value={pass}
                 onChange={(e) => setPass(e.target.value)}
               />
+
               <button style={styles.primaryBtn} type="submit">
                 Entrar
               </button>
             </form>
 
-            <div style={styles.hint}>
-              Recomendación: usa Chrome/Edge en PC para mejor experiencia.
-            </div>
+            <div style={styles.hint}>Recomendación: usa Chrome/Edge en PC para mejor experiencia.</div>
           </div>
         </div>
       </div>
@@ -862,17 +1006,22 @@ export default function App() {
             <div style={styles.brandMark} />
             <div>
               <div style={styles.headerTitle}>Desvíos automáticos</div>
-              <div style={styles.headerSub}>
-                Configuración centralizada · {user.email}
-              </div>
+              {/* ✅ aquí también va sin @ */}
+              <div style={styles.headerSub}>Configuración centralizada · {shortUser(user.email)}</div>
             </div>
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <button
-              style={{ ...styles.primaryBtn, width: "auto" }}
+              style={{
+                ...styles.primaryBtn,
+                width: "auto",
+                opacity: busyAnyDevice ? 0.6 : 1,
+                cursor: busyAnyDevice ? "not-allowed" : "pointer",
+              }}
               onClick={forceNextTurnBoth}
-              title="Fuerza el paso al siguiente turno en ambos móviles y aplica ahora"
+              disabled={busyAnyDevice}
+              title={busyAnyDevice ? busyHint : "Fuerza el paso al siguiente turno en ambos móviles y aplica ahora"}
             >
               Siguiente turno ahora (ambos)
             </button>
@@ -889,13 +1038,14 @@ export default function App() {
                 style={{
                   ...styles.primaryBtn,
                   width: "100%",
-                  opacity: busyApply ? 0.7 : 1,
+                  opacity: (busyApply || busyAnyDevice) ? 0.6 : 1,
+                  cursor: (busyApply || busyAnyDevice) ? "not-allowed" : "pointer",
                 }}
                 onClick={applyNowBoth}
-                disabled={busyApply}
-                title="Envía el comando de aplicación inmediata a ambos móviles"
+                disabled={busyApply || busyAnyDevice}
+                title={busyHint}
               >
-                {busyApply ? "Enviando…" : "Aplicar ahora (ambos)"}
+                {busyAnyDevice ? "Ocupado (aplicando…)" : busyApply ? "Enviando…" : "Aplicar ahora (ambos)"}
               </button>
 
               <button style={styles.ghostBtn} onClick={() => signOut(auth)}>
@@ -903,7 +1053,6 @@ export default function App() {
               </button>
             </div>
           </div>
-
         </header>
 
         <div style={styles.gridMain}>
@@ -913,7 +1062,7 @@ export default function App() {
             setCfg={setCfgRediris}
             optionsN1={optionsN1Rediris}
             optionsN2={optionsN2Rediris}
-            onSave={() => saveDeviceConfig("rediris", cfgRediris)}
+            onSave={() => saveDeviceConfig(DEVICES.REDIRIS, cfgRediris)}
             saving={busySave.rediris}
             isMobile={isMobile}
             styles={styles}
@@ -926,7 +1075,7 @@ export default function App() {
             setCfg={setCfgTelefonica}
             optionsN1={optionsN1Telefonica}
             optionsN2={optionsN2Telefonica}
-            onSave={() => saveDeviceConfig("telefonica", cfgTelefonica)}
+            onSave={() => saveDeviceConfig(DEVICES.TELEFONICA, cfgTelefonica)}
             saving={busySave.telefonica}
             isMobile={isMobile}
             styles={styles}
@@ -960,21 +1109,18 @@ export default function App() {
                     <div key={l.id} style={styles.logRow}>
                       <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
                         <span style={badgeForLog(l, styles)}>{l.type ?? "LOG"}</span>
-                        <span style={{ color: THEME.text2 }}>
-                          {l.deviceId ?? l.scope ?? "-"}
-                        </span>
+                        <span style={{ color: THEME.text2 }}>{l.deviceId ?? l.scope ?? "-"}</span>
                       </div>
 
                       <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                        <span style={{ color: THEME.muted, fontSize: 13 }}>
-                          {l.userEmail ?? "-"}
-                        </span>
+                        {/* ✅ logs se quedan con email completo (como querías) */}
+                        <span style={{ color: THEME.muted, fontSize: 13 }}>{l.userEmail ?? "-"}</span>
                         <span style={{ color: THEME.muted }}>·</span>
                         <span style={{ color: THEME.muted, fontSize: 13 }}>
                           {l.at?.toDate ? l.at.toDate().toLocaleString() : "-"}
                         </span>
 
-                        {(l.action || l.actionEs) ? (
+                        {l.action || l.actionEs ? (
                           <>
                             <span style={{ color: THEME.muted }}>·</span>
                             <span style={{ color: THEME.text2, fontSize: 13 }}>
@@ -995,7 +1141,7 @@ export default function App() {
   );
 }
 
-
+/** ---------------- UI COMPONENTS ---------------- */
 
 function ConfigPanel({ title, cfg, setCfg, optionsN1, optionsN2, onSave, saving, isMobile, styles, radixSelectStyles }) {
   const mode = cfg.mode || MODE.NORMAL;
@@ -1011,12 +1157,7 @@ function ConfigPanel({ title, cfg, setCfg, optionsN1, optionsN2, onSave, saving,
       setCfg({
         ...cfg,
         mode: MODE.OFICINA,
-        shifts: {
-          ...cfg.shifts,
-          morning: NONE,
-          afternoon: NONE,
-          night: NONE,
-        },
+        shifts: { ...cfg.shifts, morning: NONE, afternoon: NONE, night: NONE },
       });
       return;
     }
@@ -1025,13 +1166,7 @@ function ConfigPanel({ title, cfg, setCfg, optionsN1, optionsN2, onSave, saving,
       setCfg({
         ...cfg,
         mode: MODE.FESTIVO,
-        shifts: {
-          ...cfg.shifts,
-          morning: NONE,
-          intershift: NONE,
-          afternoon: NONE,
-          night: NONE,
-        },
+        shifts: { ...cfg.shifts, morning: NONE, intershift: NONE, afternoon: NONE, night: NONE },
       });
       return;
     }
@@ -1062,9 +1197,7 @@ function ConfigPanel({ title, cfg, setCfg, optionsN1, optionsN2, onSave, saving,
         </div>
 
         {isMobile ? (
-          <div style={{ color: THEME.text2, fontWeight: 900, fontSize: 16 }}>
-            {open ? "▲" : "▼"}
-          </div>
+          <div style={{ color: THEME.text2, fontWeight: 900, fontSize: 16 }}>{open ? "▲" : "▼"}</div>
         ) : null}
       </div>
 
@@ -1157,11 +1290,7 @@ function ConfigPanel({ title, cfg, setCfg, optionsN1, optionsN2, onSave, saving,
           </div>
 
           <button
-            style={{
-              ...styles.primaryBtn,
-              marginTop: 14,
-              opacity: saving ? 0.7 : 1,
-            }}
+            style={{ ...styles.primaryBtn, marginTop: 14, opacity: saving ? 0.7 : 1 }}
             onClick={onSave}
             disabled={saving}
           >
@@ -1180,12 +1309,7 @@ function RadioRow({ label, hint, checked, onChange, styles }) {
         <span style={{ color: THEME.text, fontWeight: 800 }}>{label}</span>
         <span style={{ color: THEME.muted, fontSize: 13 }}>{hint}</span>
       </div>
-      <input
-        type="radio"
-        checked={checked}
-        onChange={onChange}
-        style={styles.radio}
-      />
+      <input type="radio" checked={checked} onChange={onChange} style={styles.radio} />
     </label>
   );
 }
@@ -1194,15 +1318,8 @@ function Select({ label, value, options, onChange, disabled, placeholder = "— 
   return (
     <div style={{ display: "grid", gap: 6, opacity: disabled ? 0.45 : 1 }}>
       <div style={styles.label}>{label}</div>
-
       <div style={{ pointerEvents: disabled ? "none" : "auto" }}>
-        <SelectControl
-          value={value}
-          onChange={onChange}
-          options={options}
-          placeholder={placeholder}
-          styles={radixSelectStyles}
-        />
+        <SelectControl value={value} onChange={onChange} options={options} placeholder={placeholder} styles={radixSelectStyles} />
       </div>
     </div>
   );
@@ -1210,15 +1327,17 @@ function Select({ label, value, options, onChange, disabled, placeholder = "— 
 
 function DeviceCard({ title, data, styles }) {
   const dateStr = data?.lastAt?.toDate ? data.lastAt.toDate().toLocaleString() : "-";
-  const status = data?.status ?? "sin_datos";
+  const status = String(data?.status ?? "sin_datos").toLowerCase();
+
   const resultado = data?.resultado ?? data?.lastResult ?? "-";
   const motivo = data?.statusReason ?? data?.motivo ?? data?.lastReason ?? "-";
 
   const target = data?.lastTargetName ?? data?.lastTargetId ?? "-";
   const turno = data?.turno ?? data?.lastTargetMode ?? "-";
 
-  const detectedApplySource = data?.applySource
-    ?? (String(data?.resultCode ?? "").startsWith("AUTO") ? "AUTO" : null);
+  const detectedApplySource =
+    data?.applySource ?? (String(data?.resultCode ?? "").startsWith("AUTO") ? "AUTO" : null);
+
   const applySourceLabel =
     detectedApplySource === "AUTO"
       ? "Automático"
@@ -1229,15 +1348,40 @@ function DeviceCard({ title, data, styles }) {
           : "Desconocido (versión antigua)";
 
   const nextChangeStr =
-    typeof data?.nextChangeAt === "number"
-      ? new Date(data.nextChangeAt).toLocaleString()
-      : "-";
+    typeof data?.nextChangeAt === "number" ? new Date(data.nextChangeAt).toLocaleString() : "-";
+
+  const now = Date.now();
+  const lock = data?.applyLock;
+  const lockActive = !!(lock?.locked && typeof lock?.expiresAt === "number" && lock.expiresAt > now);
+  const lockBy = shortUser(lock?.lockedBy);
+  const lockExp = typeof lock?.expiresAt === "number" ? new Date(lock.expiresAt).toLocaleString() : "-";
+  const lockReason = lock?.reason || "-";
+
+  const isRunning = status === "running";
+  const isApplying = isRunning || lockActive;
+
+  const applyingLabel = "Aplicando";
+  const applyingHint = lockActive
+    ? `Bloqueado por ${lockBy} hasta ${lockExp} · motivo=${lockReason}`
+    : "El móvil indica que está ejecutando.";
 
   return (
     <div style={styles.deviceCard}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
         <div style={{ fontWeight: 800, color: THEME.text }}>{title}</div>
-        <span style={badgeForStatus(status, styles)}>{prettyStatus(status)}</span>
+
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <span style={badgeForStatus(status, styles)}>{prettyStatus(status)}</span>
+
+          {isApplying ? (
+            <span
+              title={applyingHint}
+              style={{ ...styles.badge, borderColor: "rgba(255,176,32,0.55)", color: THEME.warn }}
+            >
+              {applyingLabel}
+            </span>
+          ) : null}
+        </div>
       </div>
 
       <div style={styles.kvGrid}>
@@ -1245,16 +1389,24 @@ function DeviceCard({ title, data, styles }) {
         <KV k="Destino" v={target} />
         <KV k="Turno" v={turno} />
         <KV k="Próximo cambio" v={nextChangeStr} />
+
         <KV
           k="Motivo"
-          v={(
+          v={
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
               <span style={badgeForApplySource(detectedApplySource, styles)}>{applySourceLabel}</span>
               <span>{motivo}</span>
             </div>
-          )}
+          }
         />
-        <KV k="Última actualización" v={dateStr} />
+
+        {lockActive ? (
+          <KV k="Bloqueo" v={<span title={applyingHint}>{lockBy} · hasta {lockExp}</span>} />
+        ) : (
+          <KV k="Última actualización" v={dateStr} />
+        )}
+
+        {lockActive ? <KV k="Última actualización" v={dateStr} /> : null}
       </div>
     </div>
   );

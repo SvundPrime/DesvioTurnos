@@ -54,43 +54,166 @@ class MainActivity : ComponentActivity() {
     private data class ApplyContext(
         val source: String,
         val trigger: String,
-        val id: String
+        val id: String // IMPORTANTE: aquí guardamos lockId cuando viene de web
     )
 
     private companion object {
         const val REQ_PERMS = 1001
         const val AUTO_ALARM_REQ_CODE = 2001
 
+        // --- LOCK DISTRIBUIDO (Firestore devices/{id}.applyLock)
+        const val APPLY_LOCK_TTL_MS = 90_000L
+        const val COMMAND_ACK_TTL_MS = 300_000L
 
         const val DEVICE_ID = "rediris"
 
         const val MOBILE_EMAIL = "movil-rediris@minsait.com"
         const val MOBILE_PASS = "RedIRIS123.,"
 
-
         val ZONE: ZoneId = ZoneId.of("Europe/Madrid")
+
         private val MON_THU = setOf(
             DayOfWeek.MONDAY, DayOfWeek.TUESDAY, DayOfWeek.WEDNESDAY, DayOfWeek.THURSDAY
         )
         private val NIGHT_DJ = setOf(
             DayOfWeek.SUNDAY, DayOfWeek.MONDAY, DayOfWeek.TUESDAY, DayOfWeek.WEDNESDAY, DayOfWeek.THURSDAY
         )
+
         const val APPLY_PREFS = "apply_prefs"
-        const val SNIFFER_PREFS = "sniffer_prefs"
         const val KEY_LAST_RESULT = "last_result"
         const val KEY_LAST_TEXT = "last_text"
         const val KEY_LAST_TS = "last_timestamp"
         const val KEY_ARMED_SINCE = "armed_since"
         const val KEY_ARMED_WINDOW_MS = "armed_window_ms"
         const val KEY_EXPECTED_MMI = "expected_mmi"
+
         const val OK_TIMEOUT_MS = 60_000L
         const val RETRY_DELAY_MS = 1_200L
+
         const val APPLY_SOURCE_AUTO = "AUTO"
         const val APPLY_SOURCE_MANUAL = "MANUAL"
         const val APPLY_SOURCE_FORCED = "FORCED"
+
         const val APPLY_TRIGGER_AUTO_BOUNDARY = "AUTO_BOUNDARY"
         const val APPLY_TRIGGER_REMOTE_CMD = "REMOTE_CMD"
         const val APPLY_TRIGGER_RETRY = "RETRY"
+    }
+
+    private fun nowMs() = System.currentTimeMillis()
+
+    private fun lockRef() = db.collection("devices").document(DEVICE_ID)
+    private fun cmdRef() = db.collection("commands").document(DEVICE_ID)
+
+    /**
+     * Intenta adquirir un lock global para este dispositivo.
+     * Devuelve true si lo adquiere, false si ya estaba lockeado por otro (o por ti).
+     */
+    private fun tryAcquireApplyLock(lockId: String, reason: String, onDone: (Boolean) -> Unit) {
+        val ref = lockRef()
+        db.runTransaction { tx ->
+            val snap = tx.get(ref)
+            val data = snap.data
+            val lock = data?.get("applyLock") as? Map<*, *>
+
+            val locked = lock?.get("locked") as? Boolean ?: false
+            val expiresAt = (lock?.get("expiresAt") as? Number)?.toLong() ?: 0L
+
+            val active = locked && expiresAt > nowMs()
+            if (active) return@runTransaction false
+
+            val payload = mapOf(
+                "applyLock" to mapOf(
+                    "locked" to true,
+                    "lockId" to lockId,
+                    "lockedBy" to (auth.currentUser?.email ?: MOBILE_EMAIL),
+                    "lockedAt" to FieldValue.serverTimestamp(),
+                    "expiresAt" to (nowMs() + APPLY_LOCK_TTL_MS),
+                    "reason" to reason
+                ),
+                "status" to "running",
+                "statusReason" to "Aplicando...",
+                "lastAt" to FieldValue.serverTimestamp()
+            )
+
+            tx.set(ref, payload, SetOptions.merge())
+            true
+        }.addOnSuccessListener { ok ->
+            onDone(ok == true)
+        }.addOnFailureListener {
+            onDone(false)
+        }
+    }
+
+    private data class ApplyLock(
+        val locked: Boolean,
+        val lockId: String?,
+        val expiresAt: Long?,
+        val lockedBy: String?
+    )
+
+    private fun parseApplyLock(data: Map<String, Any?>?): ApplyLock? {
+        val lock = (data?.get("applyLock") as? Map<*, *>) ?: return null
+        val locked = (lock["locked"] as? Boolean) ?: false
+        val lockId = (lock["lockId"] as? String)?.trim()
+        val expiresAt = when (val v = lock["expiresAt"]) {
+            is Number -> v.toLong()
+            else -> null
+        }
+        val lockedBy = (lock["lockedBy"] as? String)?.trim()
+        return ApplyLock(locked, lockId, expiresAt, lockedBy)
+    }
+
+    private fun isLockActive(lock: ApplyLock?): Boolean {
+        if (lock == null) return false
+        val now = System.currentTimeMillis()
+        return lock.locked && (lock.expiresAt ?: 0L) > now
+    }
+
+    private fun isMyLockActive(lock: ApplyLock?, commandLockId: String?): Boolean {
+        if (!isLockActive(lock)) return false
+        val a = lock?.lockId?.trim().orEmpty()
+        val b = commandLockId?.trim().orEmpty()
+        return a.isNotBlank() && b.isNotBlank() && a == b
+    }
+
+    private fun releaseApplyLock(lockId: String, reason: String? = null) {
+        val ref = lockRef()
+        db.runTransaction { tx ->
+            val snap = tx.get(ref)
+            val lock = (snap.get("applyLock") as? Map<*, *>) ?: emptyMap<String, Any?>()
+            val curId = lock["lockId"] as? String
+
+            // Solo sueltas si eres el dueño
+            if (curId != lockId) return@runTransaction null
+
+            val payload = mutableMapOf<String, Any?>(
+                "applyLock" to mapOf(
+                    "locked" to false,
+                    "lockId" to curId,
+                    "releasedAt" to FieldValue.serverTimestamp(),
+                    "releaseReason" to (reason ?: "done"),
+                    "expiresAt" to 0L
+                ),
+                "lastAt" to FieldValue.serverTimestamp()
+            )
+            tx.set(ref, payload, SetOptions.merge())
+            null
+        }
+    }
+
+    private fun ackCommandHandled(requestId: String, status: String, note: String? = null) {
+        // status: "ACCEPTED" | "IGNORED_BUSY" | "IGNORED_LOCKED" | "DONE" | "FAILED"
+        if (requestId.isBlank()) return
+        val payload = mapOf(
+            "ack" to mapOf(
+                "requestId" to requestId,
+                "status" to status,
+                "note" to (note ?: ""),
+                "at" to FieldValue.serverTimestamp(),
+                "expiresAt" to (nowMs() + COMMAND_ACK_TTL_MS)
+            )
+        )
+        cmdRef().set(payload, SetOptions.merge())
     }
 
     private lateinit var tvDebug: TextView
@@ -98,13 +221,8 @@ class MainActivity : ComponentActivity() {
     private val db by lazy { FirebaseFirestore.getInstance() }
     private val auth by lazy { FirebaseAuth.getInstance() }
 
-    private val prefs: SharedPreferences by lazy {
-        getSharedPreferences("forwarding_prefs", MODE_PRIVATE)
-    }
-
-    private val applyPrefs: SharedPreferences by lazy {
-        getSharedPreferences(APPLY_PREFS, MODE_PRIVATE)
-    }
+    private val prefs: SharedPreferences by lazy { getSharedPreferences("forwarding_prefs", MODE_PRIVATE) }
+    private val applyPrefs: SharedPreferences by lazy { getSharedPreferences(APPLY_PREFS, MODE_PRIVATE) }
 
     private val handler = Handler(Looper.getMainLooper())
     private var applyInProgress = false
@@ -117,6 +235,9 @@ class MainActivity : ComponentActivity() {
         get() = prefs.getString("last_request_id", null)
         set(value) = prefs.edit { putString("last_request_id", value) }
 
+    // ✅ NUEVO: guardamos requestId para ACK (NO usar lockId)
+    private var lastCommandRequestId: String? = null
+
     private var cachedConfig: Map<String, Any?>? = null
     private var lastTargetId: String? = null
     private var lastTargetName: String? = null
@@ -128,6 +249,7 @@ class MainActivity : ComponentActivity() {
     private var lastForcedReason: String? = null
     private var currentApplyContext: ApplyContext? = null
     private val autoTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
+
     private val snifferListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         Log.e("SNIFFER_LISTENER", "TRIGGER key=$key applyInProgress=$applyInProgress applyStartMs=$applyStartMs")
 
@@ -151,10 +273,7 @@ class MainActivity : ComponentActivity() {
         val ts = applyPrefs.getLong(KEY_LAST_TS, 0L)
         val txt = applyPrefs.getString(KEY_LAST_TEXT, "") ?: ""
 
-        Log.e(
-            "SNIFFER_LISTENER",
-            "READ result='$result' ts=$ts txtLen=${txt.length} (now=${System.currentTimeMillis()})"
-        )
+        Log.e("SNIFFER_LISTENER", "READ result='$result' ts=$ts txtLen=${txt.length} (now=${System.currentTimeMillis()})")
 
         if (result.isBlank() || ts <= 0L) {
             Log.e("SNIFFER_LISTENER", "DROP empty result or ts<=0 (result='$result', ts=$ts)")
@@ -168,8 +287,17 @@ class MainActivity : ComponentActivity() {
 
         when (result) {
             "OK" -> {
-                Log.e("SNIFFER_LISTENER", "CASE OK -> stopApplyWindow + report + bringToFront")
+                Log.e("SNIFFER_LISTENER", "CASE OK -> stopApplyWindow + releaseLock + report")
+
                 stopApplyWindow()
+
+                // ✅ suelta lock real (id = lockId cuando viene de web)
+                currentApplyContext?.id?.let { lockId ->
+                    if (lockId.isNotBlank()) releaseApplyLock(lockId, reason = "OK")
+                }
+
+                // ✅ ACK con requestId real
+                ackCommandHandled(lastCommandRequestId ?: "", "DONE")
 
                 reportDeviceStatus(
                     status = "idle",
@@ -189,26 +317,21 @@ class MainActivity : ComponentActivity() {
                 bringAppToFront()
             }
 
-            "FAIL", "FAIL_MIXED" -> {
-                Log.e("SNIFFER_LISTENER", "CASE $result -> stopApplyWindow + scheduleRetry")
+            "FAIL", "FAIL_MIXED", "UNKNOWN" -> {
+                Log.e("SNIFFER_LISTENER", "CASE $result -> stopApplyWindow + releaseLock + retry")
+
                 stopApplyWindow()
+
+                currentApplyContext?.id?.let { lockId ->
+                    if (lockId.isNotBlank()) releaseApplyLock(lockId, reason = result)
+                }
+
+                // ✅ ACK con requestId real
+                ackCommandHandled(lastCommandRequestId ?: "", "FAILED", result)
 
                 scheduleRetry(
                     reasonCode = "POPUP_$result",
                     reasonEs = "Fallo al aplicar",
-                    detail = txt
-                )
-
-                bringAppToFront()
-            }
-
-            "UNKNOWN" -> {
-                Log.e("SNIFFER_LISTENER", "CASE UNKNOWN -> stopApplyWindow + scheduleRetry (conservador)")
-                stopApplyWindow()
-
-                scheduleRetry(
-                    reasonCode = "POPUP_UNKNOWN",
-                    reasonEs = "Resultado no reconocido",
                     detail = txt
                 )
 
@@ -298,11 +421,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun isFri(dow: DayOfWeek) = dow == DayOfWeek.FRIDAY
-
     private fun isMonThu(dow: DayOfWeek) = dow in MON_THU
-
     private fun isNightDJ(dow: DayOfWeek) = dow in NIGHT_DJ
-
     private fun isWeekday(dow: DayOfWeek) = dow.value in 1..5
 
     private fun inRange(t: LocalTime, start: String, end: String): Boolean {
@@ -512,44 +632,98 @@ class MainActivity : ComponentActivity() {
                 if (requestId.isBlank()) return@addSnapshotListener
                 if (requestId == lastProcessedRequestId) return@addSnapshotListener
 
-                if (applyInProgress) {
-                    Log.d("APPLY", "Ignoring APPLY_NOW requestId=$requestId because applyInProgress=true")
-                    return@addSnapshotListener
-                }
+                val cmdLockId = snap.getString("lockId")?.trim()
+                val lockIdToUse = cmdLockId?.takeIf { it.isNotBlank() } // ✅ ESTE ES EL ID QUE TIENE EL applyLock
 
-                lastProcessedRequestId = requestId
-                lastWasForced = false
-                lastForcedReason = "Aplicación manual"
-                setApplyContext(
-                    trigger = APPLY_TRIGGER_REMOTE_CMD,
-                    triggerRequestId = requestId
-                )
+                // 👇 Leemos el estado del dispositivo para evaluar lock
+                db.collection("devices").document(DEVICE_ID).get()
+                    .addOnSuccessListener { devSnap ->
+                        val devData = devSnap.data as? Map<String, Any?>
+                        val lock = parseApplyLock(devData)
 
-                reportDeviceStatus(
-                    status = "running",
-                    resultCode = "COMMAND_RECEIVED",
-                    resultadoEs = "Comando recibido",
-                    motivoEs = "Manual",
-                    lastTargetId = lastTargetId,
-                    lastTargetName = lastTargetName,
-                    nextTargetId = nextTargetId,
-                    nextTargetName = nextTargetName,
-                    nextChangeAt = nextChangeAt,
-                    turnoEs = refreshShiftNow(),
-                    forced = lastWasForced,
-                    forcedReason = lastForcedReason
-                )
-                wakeScreen()
-                bringAppToFront()
-                handler.postDelayed(
-                    {
-                        applyNowFromConfig(
+                        val lockActive = isLockActive(lock)
+                        val myLock = isMyLockActive(lock, cmdLockId)
+
+                        if (applyInProgress) {
+                            Log.d("APPLY", "IGNORE APPLY_NOW requestId=$requestId (applyInProgress=true)")
+                            return@addOnSuccessListener
+                        }
+
+                        if (lockActive && myLock) {
+                            Log.d("APPLY", "ACCEPT APPLY_NOW requestId=$requestId (my lockId=$cmdLockId)")
+                        } else if (lockActive && !myLock) {
+                            val who = lock?.lockedBy ?: "otro"
+                            val until = lock?.expiresAt ?: 0L
+                            Log.d("APPLY", "IGNORE APPLY_NOW requestId=$requestId (locked by $who until $until)")
+                            return@addOnSuccessListener
+                        } else {
+                            Log.d("APPLY", "ACCEPT APPLY_NOW requestId=$requestId (no active lock)")
+                        }
+
+                        // ✅ GUARDAMOS requestId (para ACK) y lastProcessed
+                        lastCommandRequestId = requestId
+                        lastProcessedRequestId = requestId
+
+                        lastWasForced = false
+                        lastForcedReason = "Aplicación manual"
+
+                        // ✅ CRÍTICO: context.id = lockId (si viene) para poder liberar el lock REAL
+                        setApplyContext(
                             trigger = APPLY_TRIGGER_REMOTE_CMD,
-                            triggerRequestId = requestId
+                            triggerRequestId = lockIdToUse ?: requestId
                         )
-                    },
-                    400
-                )
+
+                        reportDeviceStatus(
+                            status = "running",
+                            resultCode = "COMMAND_RECEIVED",
+                            resultadoEs = "Comando recibido",
+                            motivoEs = "Manual",
+                            lastTargetId = lastTargetId,
+                            lastTargetName = lastTargetName,
+                            nextTargetId = nextTargetId,
+                            nextTargetName = nextTargetName,
+                            nextChangeAt = nextChangeAt,
+                            turnoEs = refreshShiftNow(),
+                            forced = lastWasForced,
+                            forcedReason = lastForcedReason
+                        )
+
+                        wakeScreen()
+                        bringAppToFront()
+                        handler.postDelayed(
+                            {
+                                applyNowFromConfig(
+                                    trigger = APPLY_TRIGGER_REMOTE_CMD,
+                                    triggerRequestId = requestId // aquí puedes seguir pasando requestId como "tracking"
+                                )
+                            },
+                            400
+                        )
+                    }
+                    .addOnFailureListener {
+                        Log.e("APPLY", "WARN cannot read devices/$DEVICE_ID lock -> proceed")
+
+                        if (applyInProgress) return@addOnFailureListener
+                        if (requestId == lastProcessedRequestId) return@addOnFailureListener
+
+                        lastCommandRequestId = requestId
+                        lastProcessedRequestId = requestId
+
+                        lastWasForced = false
+                        lastForcedReason = "Aplicación manual"
+
+                        setApplyContext(
+                            trigger = APPLY_TRIGGER_REMOTE_CMD,
+                            triggerRequestId = lockIdToUse ?: requestId
+                        )
+
+                        wakeScreen()
+                        bringAppToFront()
+                        handler.postDelayed(
+                            { applyNowFromConfig(trigger = APPLY_TRIGGER_REMOTE_CMD, triggerRequestId = requestId) },
+                            400
+                        )
+                    }
             }
     }
 
@@ -608,7 +782,6 @@ class MainActivity : ComponentActivity() {
         )
 
         val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-
         am.cancel(pending)
 
         am.setExactAndAllowWhileIdle(
@@ -629,6 +802,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         cancelRetry()
+
         setApplyContext(trigger = trigger, triggerRequestId = triggerRequestId)
 
         val cfg = cachedConfig
@@ -644,11 +818,7 @@ class MainActivity : ComponentActivity() {
 
         val now = ZonedDateTime.now(ZONE)
         val ov = readOverrideUi(cfg)
-        setApplyContext(
-            trigger = trigger,
-            triggerRequestId = triggerRequestId,
-            overrideUi = ov
-        )
+        setApplyContext(trigger = trigger, triggerRequestId = triggerRequestId, overrideUi = ov)
 
         val nextAt = computeNextBoundaryAt(cfg, now)
         scheduleAlarm(nextAt)
@@ -755,16 +925,10 @@ class MainActivity : ComponentActivity() {
             .addOnFailureListener { cb(null) }
     }
 
-    private fun resolveContactData(
-        contactId: String,
-        cb: (label: String?, displayName: String?) -> Unit
-    ) {
+    private fun resolveContactData(contactId: String, cb: (label: String?, displayName: String?) -> Unit) {
         db.collection("contacts").document(contactId).get()
             .addOnSuccessListener { snap ->
-                if (!snap.exists()) {
-                    cb(null, null)
-                    return@addOnSuccessListener
-                }
+                if (!snap.exists()) { cb(null, null); return@addOnSuccessListener }
 
                 val labels = snap.get("labelsByDevice") as? Map<*, *>
 
@@ -774,12 +938,9 @@ class MainActivity : ComponentActivity() {
                     ?.takeIf { it.isNotBlank() && it != NONE_ID }
 
                 val displayName = snap.getString("displayName")
-
                 cb(label, displayName)
             }
-            .addOnFailureListener {
-                cb(null, null)
-            }
+            .addOnFailureListener { cb(null, null) }
     }
 
     private fun wakeScreen() {
@@ -814,13 +975,12 @@ class MainActivity : ComponentActivity() {
     private fun requestNeededPermissions() {
         val needed = mutableListOf<String>()
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE)
-            != PackageManager.PERMISSION_GRANTED
-        ) needed.add(Manifest.permission.CALL_PHONE)
-
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS)
-            != PackageManager.PERMISSION_GRANTED
-        ) needed.add(Manifest.permission.READ_CONTACTS)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.CALL_PHONE)
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.READ_CONTACTS)
+        }
 
         if (needed.isEmpty()) {
             Toast.makeText(this, "Permisos OK", Toast.LENGTH_SHORT).show()
@@ -831,19 +991,11 @@ class MainActivity : ComponentActivity() {
     }
 
     @Deprecated("Deprecated; kept for simplicity in this prototype.")
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<String>,
-        grantResults: IntArray
-    ) {
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQ_PERMS) {
             val allGranted = grantResults.all { it == PackageManager.PERMISSION_GRANTED }
-            Toast.makeText(
-                this,
-                if (allGranted) "Permisos concedidos" else "Faltan permisos",
-                Toast.LENGTH_SHORT
-            ).show()
+            Toast.makeText(this, if (allGranted) "Permisos concedidos" else "Faltan permisos", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -879,11 +1031,23 @@ class MainActivity : ComponentActivity() {
 
         beginApplyWindow(canonicalMmi)
 
-        dismissSwipeKeyguardIfNeeded {
-            handler.postDelayed({
+        dismissSwipeKeyguardIfNeeded { unlocked ->
+            handler.post {
                 dumpLockState("AFTER_DISMISS_BEFORE_DIAL")
+
+                if (!unlocked) {
+                    Log.e("APPLY", "ABORT: still locked after dismiss -> scheduleRetry")
+                    stopApplyWindow()
+                    scheduleRetry(
+                        reasonCode = "KEYGUARD_LOCKED",
+                        reasonEs = "Pantalla bloqueada",
+                        detail = "No se pudo desbloquear para marcar"
+                    )
+                    return@post
+                }
+
                 dialForwarding(canonicalMmi, raw)
-            }, 250)
+            }
         }
     }
 
@@ -891,9 +1055,7 @@ class MainActivity : ComponentActivity() {
         Log.e("APPLY", "Dialing canonical MMI='$canonicalMmi' (raw='$rawFromContact')")
 
         val uri = Uri.parse("tel:" + Uri.encode(canonicalMmi))
-        val intent = Intent(Intent.ACTION_DIAL, uri).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
+        val intent = Intent(Intent.ACTION_DIAL, uri).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
 
         startActivity(intent)
 
@@ -935,6 +1097,13 @@ class MainActivity : ComponentActivity() {
         timeoutRunnable?.let { handler.removeCallbacks(it) }
         timeoutRunnable = Runnable {
             if (!applyInProgress) return@Runnable
+
+            // ✅ TIMEOUT: suelta lock real y ACK
+            currentApplyContext?.id?.let { lockId ->
+                if (lockId.isNotBlank()) releaseApplyLock(lockId, reason = "TIMEOUT")
+            }
+            ackCommandHandled(lastCommandRequestId ?: "", "FAILED", "TIMEOUT")
+
             Log.e("APPLY", "TIMEOUT reached -> bringAppToFront + scheduleRetry")
             bringAppToFront()
             scheduleRetry(
@@ -951,10 +1120,12 @@ class MainActivity : ComponentActivity() {
         applyStartMs = 0L
         timeoutRunnable?.let { handler.removeCallbacks(it) }
         timeoutRunnable = null
+
         applyPrefs.edit {
             putLong(KEY_ARMED_SINCE, 0L)
             putString(KEY_EXPECTED_MMI, "")
         }
+
         releaseWakeLock()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
@@ -970,17 +1141,19 @@ class MainActivity : ComponentActivity() {
         startActivity(i)
     }
 
-    private fun scheduleRetry(
-        reasonCode: String,
-        reasonEs: String,
-        detail: String
-    ) {
+    private fun scheduleRetry(reasonCode: String, reasonEs: String, detail: String) {
         timeoutRunnable?.let { handler.removeCallbacks(it) }
         timeoutRunnable = null
         retryRunnable?.let { handler.removeCallbacks(it) }
         retryRunnable = null
 
+        // ✅ suelta lock (si existe)
+        currentApplyContext?.id?.let { lockId ->
+            if (lockId.isNotBlank()) releaseApplyLock(lockId, reason = "RETRY_SCHEDULED:$reasonCode")
+        }
+
         setApplyContext(trigger = APPLY_TRIGGER_RETRY)
+
         reportDeviceStatus(
             status = "running",
             resultCode = "RETRYING",
@@ -1063,7 +1236,6 @@ class MainActivity : ComponentActivity() {
             "nextTargetId" to nextTargetId,
             "nextTargetName" to nextTargetName,
             "nextChangeAt" to (nextChangeAt?.toInstant()?.toEpochMilli()),
-
             "lastAt" to FieldValue.serverTimestamp(),
             "forced" to forced,
             "forcedReason" to forcedReason,
@@ -1071,15 +1243,12 @@ class MainActivity : ComponentActivity() {
             "applyTrigger" to derivedApplyTrigger,
             "applyId" to applyContext?.id
         )
-        val fp = payload.entries
-            .sortedBy { it.key }
-            .joinToString("|") { "${it.key}=${it.value}" }
 
+        val fp = payload.entries.sortedBy { it.key }.joinToString("|") { "${it.key}=${it.value}" }
         if (fp == lastStatusFingerprint) return
         lastStatusFingerprint = fp
 
-        db.collection("devices").document(DEVICE_ID)
-            .set(payload, SetOptions.merge())
+        db.collection("devices").document(DEVICE_ID).set(payload, SetOptions.merge())
     }
 
     private fun reportIdleStatus(
@@ -1117,7 +1286,9 @@ class MainActivity : ComponentActivity() {
         overrideUi: OverrideUi? = null
     ) {
         val existing = currentApplyContext
+
         val baseId = when {
+            // ✅ REMOTE_CMD: si te pasan lockId, aquí se queda como id (para releaseApplyLock)
             trigger == APPLY_TRIGGER_REMOTE_CMD && !triggerRequestId.isNullOrBlank() -> triggerRequestId
             trigger == APPLY_TRIGGER_AUTO_BOUNDARY -> newApplyId("auto")
             trigger == APPLY_TRIGGER_RETRY -> existing?.id ?: newApplyId("retry")
@@ -1158,7 +1329,6 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("ScheduleExactAlarm")
     private fun scheduleForwardingInSeconds(seconds: Int) {
         val triggerAt = System.currentTimeMillis() + seconds * 1000L
-
         val intent = buildAutoBoundaryIntent()
 
         val pending = PendingIntent.getBroadcast(
@@ -1181,10 +1351,7 @@ class MainActivity : ComponentActivity() {
     private fun acquireWakeLock(ms: Long = 12_000L) {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wl?.let { if (it.isHeld) it.release() }
-        wl = pm.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "desviosturnos:apply"
-        ).apply { acquire(ms) }
+        wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "desviosturnos:apply").apply { acquire(ms) }
     }
 
     private fun ensureScreenOn() {
@@ -1206,37 +1373,41 @@ class MainActivity : ComponentActivity() {
 
         Log.e(
             "LOCK_STATE",
-            "$tag interactive=${pm.isInteractive} " +
-                    "keyguardLocked=${km.isKeyguardLocked} " +
-                    "keyguardSecure=${km.isKeyguardSecure}"
+            "$tag interactive=${pm.isInteractive} keyguardLocked=${km.isKeyguardLocked} keyguardSecure=${km.isKeyguardSecure}"
         )
     }
 
-    private fun dismissSwipeKeyguardIfNeeded(onDone: () -> Unit) {
+    private fun dismissSwipeKeyguardIfNeeded(onDone: (unlocked: Boolean) -> Unit) {
         val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
 
-        if (km.isKeyguardLocked && !km.isKeyguardSecure) {
-            Log.e("KEYGUARD", "Requesting dismiss (swipe lock)")
-            km.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
-                override fun onDismissSucceeded() {
-                    Log.e("KEYGUARD", "Dismiss succeeded")
-                    onDone()
-                }
+        fun checkUnlocked(): Boolean = !km.isKeyguardLocked
 
-                override fun onDismissCancelled() {
-                    Log.e("KEYGUARD", "Dismiss cancelled")
-                    onDone()
-                }
-
-                override fun onDismissError() {
-                    Log.e("KEYGUARD", "Dismiss error")
-                    onDone()
-                }
-            })
+        if (!km.isKeyguardLocked || km.isKeyguardSecure) {
+            onDone(true)
             return
         }
 
-        onDone()
+        Log.e("KEYGUARD", "Requesting dismiss (swipe lock)")
+
+        var finished = false
+        val handler = Handler(Looper.getMainLooper())
+
+        fun finish(tag: String) {
+            if (finished) return
+            finished = true
+            handler.removeCallbacksAndMessages(null)
+            val unlocked = checkUnlocked()
+            Log.e("KEYGUARD", "Finish($tag) unlocked=$unlocked keyguardLocked=${km.isKeyguardLocked}")
+            onDone(unlocked)
+        }
+
+        handler.postDelayed({ finish("timeout") }, 2500L)
+
+        km.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+            override fun onDismissSucceeded() { Log.e("KEYGUARD", "Dismiss succeeded"); finish("succeeded") }
+            override fun onDismissCancelled() { Log.e("KEYGUARD", "Dismiss cancelled"); finish("cancelled") }
+            override fun onDismissError() { Log.e("KEYGUARD", "Dismiss error"); finish("error") }
+        })
     }
 
     private fun isWeekendN2Window(at: ZonedDateTime): Boolean {
@@ -1306,7 +1477,6 @@ class MainActivity : ComponentActivity() {
         putExtra(EXTRA_ALARM_TYPE, ALARM_TYPE_AUTO_BOUNDARY)
         putExtra(EXTRA_ALARM_APPLY_NOW, true)
     }
-
 
     private fun selectNextTurn(cfg: Map<String, Any?>, now: ZonedDateTime): Selection {
         val nextAt = computeNextBoundaryAt(cfg, now)
